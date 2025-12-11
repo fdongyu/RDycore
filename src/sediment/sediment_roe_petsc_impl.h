@@ -62,6 +62,23 @@ static PetscErrorCode ComputeSedimentRoeFlux(SedimentRiemannStateData *datal, Se
       dch[j]   = cir[ci_index_offset + j] * hr[i] - cil[ci_index_offset + j] * hl[i];
     }
 
+    // DEBUG
+    /*
+    if ((i == 3796 || i == 3987 || i == 3991)){
+      printf("\n");
+      printf(" hl  = %+e, hr  = %+e \n",hl[i],hr[i]);
+      printf(" hul = %+e, hur = %+e \n",hl[i]*ul[i],hr[i]*ur[i]);
+      printf(" hvl = %+e, hvr = %+e \n",hl[i]*vl[i],hr[i]*vr[i]);
+      printf(" hcl = %+e, hcr = %+e \n",hl[i]*cil[ci_index_offset],hr[i]*cir[ci_index_offset]);
+      printf(" ul  = %+e, ur  = %+e \n",ul[i],ur[i]);
+      printf(" vl  = %+e, vr  = %+e \n",vl[i],vr[i]);
+      printf(" cil = %+e, cir = %+e, cihat = %+e \n",cil[ci_index_offset],cir[ci_index_offset],cihat[0]);
+      printf(" uperpl = %+e, uperpr = %+e \n",uperpl,uperpr);
+      printf(" amax_swe = %+e \n",amax_swe);
+    }
+    */
+    //
+
     for (PetscInt i = 0; i < 3; ++i) {
       for (PetscInt j = 0; j < 3; ++j) {
         R[i][j] = R_swe[i][j];
@@ -97,6 +114,9 @@ static PetscErrorCode ComputeSedimentRoeFlux(SedimentRiemannStateData *datal, Se
     FR[2] = vr[i] * uperpr * hr[i] + 0.5 * GRAVITY * hr[i] * hr[i] * sn[i];
 
     ci_index_offset = i * sed_ncomp;
+
+    // TO FIX
+    /*
     for (PetscInt j = 0; j < sed_ncomp; j++) {
       FL[j + 3] = hl[i] * uperpl * cil[ci_index_offset + j];
       FR[j + 3] = hr[i] * uperpr * cir[ci_index_offset + j];
@@ -111,6 +131,49 @@ static PetscErrorCode ComputeSedimentRoeFlux(SedimentRiemannStateData *datal, Se
         fij[soln_ncomp * i + dof1] = fij[soln_ncomp * i + dof1] - 0.5 * R[dof1][dof2] * A[dof2] * dW[dof2];
       }
     }
+    */
+
+    PetscReal Fh_num_roe = 0.5 * (FL[0] + FR[0])
+                         - 0.5 * ( R_swe[0][0]*A_swe[0]*dW_swe[0]
+                                 + R_swe[0][1]*A_swe[1]*dW_swe[1]
+                                 + R_swe[0][2]*A_swe[2]*dW_swe[2] );
+
+    for (PetscInt dof1 = 0; dof1 < 3; dof1++) {
+      PetscReal Fnum = 0.5 * (FL[dof1] + FR[dof1])
+                     - 0.5 * ( R_swe[dof1][0]*A_swe[0]*dW_swe[0]
+                             + R_swe[dof1][1]*A_swe[1]*dW_swe[1]
+                             + R_swe[dof1][2]*A_swe[2]*dW_swe[2] );
+      fij[soln_ncomp * i + dof1] = Fnum;
+    }
+
+
+    for (PetscInt j = 0; j < sed_ncomp; j++) {
+      // upwind concentration by the sign of the *hydro mass flux*
+      PetscReal cL = cil[ci_index_offset + j];
+      PetscReal cR = cir[ci_index_offset + j];
+      PetscReal Cup = (Fh_num_roe >= 0.0) ? cL : cR;
+
+      // Final sediment (hC) flux on this face and class j
+      fij[soln_ncomp * i + (3 + j)] = Fh_num_roe * Cup;
+    }
+
+
+    // DEBUG
+    /*
+    if ((i == 3796 || i == 3987 || i == 3991)){
+      printf("fij[0] = %+e\n",fij[soln_ncomp * i + 0]);
+      printf("fij[1] = %+e\n",fij[soln_ncomp * i + 1]);
+      printf("fij[2] = %+e\n",fij[soln_ncomp * i + 2]);
+      printf("fij[3] = %+e\n",fij[soln_ncomp * i + 3]);
+      PetscReal hc_l = hl[i] * cil[ci_index_offset];
+      PetscReal hc_r = hr[i] * cir[ci_index_offset];
+      PetscReal huc_l = hc_l * uperpl;
+      PetscReal huc_r = hc_r * uperpr;
+      //printf(" FluxC_edge = %e\n", 0.5*( huc_l + huc_r - cihat[0] * (hc_r - hc_l)));
+    }
+    */
+    //
+
 
     amax[i] = amax_swe;
   }

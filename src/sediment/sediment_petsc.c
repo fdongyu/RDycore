@@ -7,6 +7,11 @@
 
 #include "sediment_roe_petsc_impl.h"
 
+PetscReal s_bnd_flux_inst = 0.0;  // DEBUG Σ_edges (L_e * F_{hC,e}) for the *current* RHS build
+void SedBndFluxReset(void)            { s_bnd_flux_inst = 0.0; }
+void SedBndFluxAccumulate(PetscReal v){ s_bnd_flux_inst += v; }
+PetscReal SedBndFluxTake(void)        { PetscReal v = s_bnd_flux_inst; s_bnd_flux_inst = 0.0; return v; }
+
 /// @brief Allocates memory for prognostic (h/hu/hv/hci) and diagnostic (u/v/ci) variables stored at
 ///        cell centers for sediment dynamics
 /// @param [in]  num_states        number of states
@@ -97,6 +102,7 @@ static PetscErrorCode CreateSedimentRiemannEdgeData(PetscInt num_edges, PetscInt
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
+
 
 /// @brief Computes diagnostic variables (u/v/ci) from prognostic variables (h/hu/hv/hci)
 /// @param [in]  tiny_h  a height threshold for determining wet/dry cell
@@ -219,6 +225,39 @@ static PetscErrorCode ApplySedimentInteriorFlux(void *context, PetscOperatorFiel
       PetscCheck(PETSC_FALSE, comm, PETSC_ERR_USER, "Unsupported Riemann solver");
   }
 
+  // DEBUG
+  // For each interior edge e (loop you already have over internal edges):
+  // edge_id, left_local_cell_id (L), right_local_cell_id (R) are already available
+  static PetscReal g_int_mass_change = 0.0;  // net interior tracer mass change for this call
+  for (PetscInt e = 0; e < mesh->num_internal_edges; ++e) {
+    PetscInt edge_id             = edges->internal_edge_ids[e];
+    PetscInt left_local_cell_id  = edges->cell_ids[2 * edge_id    ];
+    PetscInt right_local_cell_id = edges->cell_ids[2 * edge_id + 1];
+    const PetscReal Le  = edges->lengths[edge_id];
+    const PetscReal AL  = cells->areas[left_local_cell_id];
+    const PetscReal AR  = cells->areas[right_local_cell_id];
+
+    // --- TRACER (hC) antisymmetric assembly: one add per edge, − on L / + on R ---
+    for (PetscInt s = 0; s < num_sediment_comp; ++s) {
+      const PetscInt dof = 3 + s;  // tracer starts after [h,hu,hv]
+      const PetscReal FhC = (PetscReal)flux_vec_int[n_dof * e + dof]; // L->R flux density
+
+      // audit mass contributed by this edge (areas cancel in global mass)
+      g_int_mass_change += (-FhC * Le) + (+FhC * Le);  // should be exactly 0
+    }
+  }
+
+  PetscCall(PetscObjectGetComm((PetscObject)u_local, &comm));
+  PetscReal g_int_mass_change_glob = 0.0;
+  PetscCall(MPIU_Allreduce(&g_int_mass_change, &g_int_mass_change_glob, 1, MPIU_REAL, MPIU_SUM, comm));
+  /*
+  PetscCall(PetscPrintf(comm,
+    "[INT] net interior mass change this call = %.6e (should be ~0)\n", g_int_mass_change_glob));
+  */
+  g_int_mass_change = 0.0;
+  // --------------------------------
+
+
   // accummulate the flux values in the global flux vector
   for (PetscInt e = 0; e < mesh->num_internal_edges; e++) {
     PetscInt edge_id             = edges->internal_edge_ids[e];
@@ -252,6 +291,7 @@ static PetscErrorCode ApplySedimentInteriorFlux(void *context, PetscOperatorFiel
 
           if (cells->is_owned[right_local_cell_id]) {
             PetscInt right_owned_cell_id = cells->local_to_owned[right_local_cell_id];
+ 
             f_ptr[n_dof * right_owned_cell_id + i_dof] += flux_vec_int[n_dof * e + i_dof] * (edge_len / arear);
           }
         }
@@ -472,6 +512,7 @@ static PetscErrorCode ApplySedimentBoundaryFlux(void *context, PetscOperatorFiel
       PetscCheck(PETSC_FALSE, comm, PETSC_ERR_USER, "Invalid boundary condition encountered for boundary %" PetscInt_FMT "\n", boundary.id);
   }
 
+
   // call Riemann solver
   switch (boundary_flux_op->riemann) {
     case RIEMANN_ROE:
@@ -480,6 +521,87 @@ static PetscErrorCode ApplySedimentBoundaryFlux(void *context, PetscOperatorFiel
     default:
       PetscCheck(PETSC_FALSE, comm, PETSC_ERR_USER, "Unsupported Riemann solver");
   }
+
+  // FIX
+  const PetscReal epsF = 1e-14; // tiny threshold for "no through-flow"
+  // --- TELEMAC-style FV upwinding for tracer at boundaries ------------------
+  // Overwrite sediment flux components so tracer follows the hydro mass flux.
+  // Assumptions:
+  //  - boundary_fluxes_ptr[n_dof*e + 0] is the h (mass) flux through the boundary face,
+  //    oriented from the interior ("left") to the boundary ("right").
+  //  - datal->ci and datar->ci hold cell-centered concentrations for interior and boundary.
+  //  - sediment components start at offset 3: [h, hu, hv, hC_0, hC_1, ...].
+  for (PetscInt e = 0; e < boundary.num_edges; ++e) {
+    const PetscReal Fh = (PetscReal)boundary_fluxes_ptr[n_dof * e + 0]; // hydro mass flux (signed)
+    for (PetscInt s = 0; s < num_sediment_comp; ++s) {
+      const PetscInt ci_off = e * num_sediment_comp + s;
+      const PetscReal c_int = (PetscReal)datal->ci[ci_off]; // interior C
+      const PetscReal c_bc  = (PetscReal)datar->ci[ci_off]; // boundary C (from BC)
+      PetscReal Cup;
+
+      if      (Fh >  epsF) Cup = c_int;  // outflow: use interior concentration
+      else if (Fh < -epsF) Cup = c_bc;   // inflow:  use boundary concentration
+      else                 Cup = 0.0;    // no through-flow: zero tracer flux
+
+      boundary_fluxes_ptr[n_dof * e + (3 + s)] = Fh * Cup; // overwrite hC flux
+    }
+  }
+  // --------------------------------------------------------------------------
+
+  // ---- Boundary audit (per-step totals) --------------------------------------
+  // Sum (edge_len * flux) across boundary to get integrated fluxes.
+  // Convention: Fh > 0 means leaving the domain (outflow).
+  PetscReal sumFh_pos  = 0.0, sumFh_neg  = 0.0;   // water (h) fluxes
+  PetscReal sumHC_pos  = 0.0, sumHC_neg  = 0.0;   // total tracer (Σ components)
+
+  for (PetscInt e = 0; e < boundary.num_edges; ++e) {
+    PetscInt  edge_id       = boundary.edge_ids[e];
+    PetscReal edge_len      = edges->lengths[edge_id];
+    const PetscReal Fh = (PetscReal)boundary_fluxes_ptr[n_dof*e + 0];
+
+    // sum tracer flux across ALL components on this face
+    PetscReal FhC_face = 0.0;
+    for (PetscInt s = 0; s < num_sediment_comp; ++s) {
+      FhC_face += (PetscReal)boundary_fluxes_ptr[n_dof*e + (3 + s)];
+    }
+
+    if      (Fh >  epsF) { sumFh_pos += Fh * edge_len;  sumHC_pos += FhC_face * edge_len; }
+    else if (Fh < -epsF) { sumFh_neg += Fh * edge_len;  sumHC_neg += FhC_face * edge_len; }
+    else { /* no-through-flow */ }
+  }
+
+  // print every step with a small threshold:
+  if (fabs(sumHC_pos + sumHC_neg) > 1e-12) {
+    PetscCall(PetscObjectGetComm((PetscObject)u_local, &comm));
+    PetscCall(PetscPrintf(comm,
+      "[BND] water: out=%.6e in=%.6e  tracer: out=%.6e in=%.6e (sum=%.6e)\n",
+      sumFh_pos, sumFh_neg, sumHC_pos, sumHC_neg, (sumHC_pos + sumHC_neg)));
+  }
+  SedBndFluxAccumulate(sumHC_pos + sumHC_neg); // <-- this is Σ_edges (L * F_hC), per step
+  // ---------------------------------------------------------------------------
+
+
+  // Print once: max |hC| wall-edge flux on first call for reflecting BCs.
+// (No time variables used; guarded by a static flag.)
+{
+  static PetscBool printed_once = PETSC_FALSE;
+  if (!printed_once && boundary_condition.flow->type == CONDITION_REFLECTING) {
+    const PetscInt ns   = datal->num_sediment_comp;
+    const PetscInt ndof = datal->num_flow_comp + datal->num_sediment_comp;
+
+    PetscReal max_hc_flux = 0.0;
+    for (PetscInt e = 0; e < boundary.num_edges; ++e) {
+      for (PetscInt s = 0; s < ns; ++s) {
+        PetscReal fhc = PetscAbsReal(boundary_fluxes_ptr[ndof * e + 3 + s]);
+        if (fhc > max_hc_flux) max_hc_flux = fhc;
+      }
+    }
+    PetscPrintf(comm, "[DBG] max |hC| wall-edge flux (first call): %.6e\n", max_hc_flux);
+    printed_once = PETSC_TRUE;
+  }
+}
+
+
 
   // accumulate the flux values in f_global
   RDyCells                 *cells             = &boundary_flux_op->mesh->cells;
@@ -621,10 +743,10 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 
   // FIXME: Need to move these constants into a struct that is specific to the erosion/deposition
   // parameterization
-  const PetscReal kp_constant             = 0.001;
-  const PetscReal settling_velocity       = 0.01;
-  const PetscReal tau_critical_erosion    = 0.1;
-  const PetscReal tau_critical_deposition = 1000.0;
+  const PetscReal kp_constant             = 4.e-06;
+  const PetscReal settling_velocity       = 5.e-04;
+  const PetscReal tau_critical_erosion    = 0.25;
+  const PetscReal tau_critical_deposition = 0.08;
   const PetscReal rhow                    = DENSITY_OF_WATER;
 
   // access Vec data
@@ -686,7 +808,15 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
           PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
           PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
 
-          f_ptr[n_dof * owned_cell_id + 3 + s] += (ei - di) + source_ptr[n_dof * owned_cell_id + 3 + s];
+          //f_ptr[n_dof * owned_cell_id + 3 + s] += (ei - di) + source_ptr[n_dof * owned_cell_id + 3 + s];
+	  f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
+
+	  // DEBUG
+	  if (source_ptr[n_dof * owned_cell_id + 3 + s] < 0.0) {
+            printf("Warning: Negative sediment source term encountered in cell %d = %f\n",cells->global_ids[c], source_ptr[n_dof * owned_cell_id + 3 + s]);
+	  }
+          //
+	  
         }
       }
 
