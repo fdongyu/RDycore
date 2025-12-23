@@ -717,7 +717,183 @@ typedef struct {
   Vec       mannings;           // mannings coefficient vector
   PetscReal tiny_h;             // minimum water height for wet conditions
   PetscReal xq2018_threshold;   // threshold for the XQ2018's implicit time integration of source term
+				
+  // --- 2-layer bed model (active layer + substrate) ---				
+  PetscInt  num_bed_layers;           // fixed to 2 in this scheme
+  PetscReal active_layer_thickness;   // target active-layer thickness [m]
+  PetscReal substrate_thickness;      // initial substrate thickness [m]
+  PetscReal *bed_mass;                // size = num_bed_layers * num_cells * num_sediment_comp [kg/m^2]
+  PetscReal *bed_porosity;            // size = num_bed_layers, e.g., {0.4, 0.4}
+  PetscReal *bed_rho_s;               // size = num_sediment_comp, sediment densities [kg/m^3]
 } SedimentSourceOperator;
+
+// layer index: 0 = active layer, 1 = substrate
+// index helper:
+#define BED_INDEX(layer, cell, s, num_cells, num_sediment_comp) \
+  (((layer) * (num_cells) + (cell)) * (num_sediment_comp) + (s))
+
+
+// Initialize a simple 2-layer bed (active + substrate)
+// For now we use simple defaults;
+static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RDyConfig config) {
+  PetscFunctionBeginUser;
+
+  RDyMesh  *mesh   = op->mesh;
+  RDyCells *cells  = &mesh->cells;
+  PetscInt  ncells = mesh->num_cells;
+  PetscInt  ns     = op->num_sediment_comp;
+
+  // Set number of bed layers: 0 = active, 1 = substrate
+  op->num_bed_layers         = 2;
+  op->active_layer_thickness = 0.05;  // [m] example; tune as needed
+  op->substrate_thickness    = 0.1;  // [m] example; tune as needed
+
+  // Allocate porosities for layers
+  PetscCall(PetscCalloc1(op->num_bed_layers, &op->bed_porosity));
+  op->bed_porosity[0] = 0.4;  // active layer porosity
+  op->bed_porosity[1] = 0.4;  // substrate porosity
+
+  // Allocate sediment densities (per class)
+  PetscCall(PetscCalloc1(ns, &op->bed_rho_s));
+  for (PetscInt s = 0; s < ns; ++s) {
+    op->bed_rho_s[s] = 2650.0;  // [kg/m^3], quartz-like sand; adjust per class if needed
+  }
+
+  // Allocate bed mass array: [layer][cell][class]
+  PetscInt nbed = op->num_bed_layers * ncells * ns;
+  PetscCall(PetscCalloc1(nbed, &op->bed_mass));
+
+  // Initialize mass from thickness, porosity, and density
+  // solid_mass = rho_s * (1 - porosity) * thickness
+  for (PetscInt c = 0; c < ncells; ++c) {
+    for (PetscInt s = 0; s < ns; ++s) {
+      PetscReal rho_s  = op->bed_rho_s[s];
+
+      PetscReal m_active = rho_s * (1.0 - op->bed_porosity[0]) * op->active_layer_thickness / (PetscReal)ns;
+      PetscReal m_sub    = rho_s * (1.0 - op->bed_porosity[1]) * op->substrate_thickness    / (PetscReal)ns;
+
+      PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns); // active
+      PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns); // substrate
+
+      op->bed_mass[idx_a] = m_active;
+      op->bed_mass[idx_s] = m_sub;
+    }
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// GAIA-style active-layer update for a 2-layer bed (active + substrate)
+// Keeps the active layer thickness near op->active_layer_thickness by
+// exchanging mass between layer 0 (active) and layer 1 (substrate).
+static PetscErrorCode SedimentUpdateBedActiveLayer2Layer(SedimentSourceOperator *op) {
+  PetscFunctionBeginUser;
+
+  RDyMesh  *mesh   = op->mesh;
+  RDyCells *cells  = &mesh->cells;
+  PetscInt  ncells = mesh->num_cells;
+  PetscInt  ns     = op->num_sediment_comp;
+
+  PetscReal *M          = op->bed_mass;
+  PetscReal *porosity   = op->bed_porosity;
+  PetscReal *rho_s      = op->bed_rho_s;
+  PetscReal  h_target   = op->active_layer_thickness;
+
+  for (PetscInt c = 0; c < ncells; ++c) {
+    // --- Compute thickness for active (L=0) and substrate (L=1) from mass ---
+    PetscReal h_layer[2] = {0.0, 0.0};
+
+    for (PetscInt L = 0; L < 2; ++L) {
+      PetscReal M_tot    = 0.0;
+      PetscReal rho_bulk = 0.0;
+
+      for (PetscInt s = 0; s < ns; ++s) {
+        PetscInt  idx = BED_INDEX(L, c, s, ncells, ns);
+        PetscReal m   = M[idx];
+        M_tot += m;
+      }
+
+      if (M_tot > 0.0) {
+        for (PetscInt s = 0; s < ns; ++s) {
+          PetscInt  idx = BED_INDEX(L, c, s, ncells, ns);
+          PetscReal m   = M[idx];
+          PetscReal frac = m / M_tot;
+          rho_bulk += frac * rho_s[s];
+        }
+        h_layer[L] = M_tot / (rho_bulk * (1.0 - porosity[L]));
+      } else {
+        h_layer[L] = 0.0;
+      }
+    }
+
+    PetscReal h_a  = h_layer[0]; // active layer thickness
+    PetscReal h_s  = h_layer[1]; // substrate thickness
+    PetscReal dht  = h_a - h_target;  // THICK_TRANSFER in GAIA
+
+    // ---------------------------------------------------------
+    // CASE 1: active layer too thick → push mass from layer 0 → 1
+    // ---------------------------------------------------------
+    if (dht > 0.0 && h_a > 0.0) {
+      PetscReal frac = dht / h_a; // fraction of active layer to move down
+
+      for (PetscInt s = 0; s < ns; ++s) {
+        PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
+        PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+
+        PetscReal dm = frac * M[idx_a];
+        if (dm > M[idx_a]) dm = M[idx_a];
+
+        M[idx_a] -= dm;
+        M[idx_s] += dm;
+      }
+    }
+    // ---------------------------------------------------------
+    // CASE 2: active layer too thin → pull mass from layer 1 → 0
+    // ---------------------------------------------------------
+    else if (dht < 0.0) {
+      PetscReal need = -dht;  // thickness to gain in active layer
+
+      // Void ratio correction (RATIO_XKV in GAIA)
+      PetscReal ratio_xkv = (1.0 - porosity[1]) / (1.0 - porosity[0]);
+      PetscReal eff_h_sub = h_s * ratio_xkv;
+
+      if (eff_h_sub <= 0.0) continue;
+
+      if (need >= eff_h_sub) {
+        // We need at least this much: move the entire substrate layer to active
+        for (PetscInt s = 0; s < ns; ++s) {
+          PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
+          PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+
+          PetscReal dm = M[idx_s];
+
+          M[idx_s] -= dm;
+          M[idx_a] += dm;
+        }
+        // We could still be too thin, but with 2 layers there is no deeper bed.
+      } else {
+        // Only need a fraction of the substrate layer
+        PetscReal frac = need / eff_h_sub;
+
+        for (PetscInt s = 0; s < ns; ++s) {
+          PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
+          PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+
+          PetscReal dm = frac * M[idx_s];
+          if (dm > M[idx_s]) dm = M[idx_s];
+
+          M[idx_s] -= dm;
+          M[idx_a] += dm;
+        }
+      }
+    }
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
 
 /// @brief Set the contribution of the source-term using the semi-implicit time integeration method
 ///        for the friction term in SWE.
@@ -740,6 +916,12 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
   RDyCells               *cells             = &mesh->cells;
   PetscReal               tiny_h            = source_op->tiny_h;
   PetscInt                num_sediment_comp = source_op->num_sediment_comp;
+
+  // 2-layer bed pointers
+  PetscInt  ncells = mesh->num_cells;
+  PetscReal *bed_mass     = source_op->bed_mass;
+  PetscReal *bed_porosity = source_op->bed_porosity;
+  PetscReal *bed_rho_s    = source_op->bed_rho_s;
 
   // FIXME: Need to move these constants into a struct that is specific to the erosion/deposition
   // parameterization
@@ -803,13 +985,69 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
         for (PetscInt s = 0; s < num_sediment_comp; s++) {
-          PetscReal ci    = u_ptr[n_dof * c + 3 + s] / h;
+	  PetscInt  owned_id = owned_cell_id;
+	  PetscReal hc = u_ptr[n_dof * c + 3 + s];
+          PetscReal ci    = hc / h;
           PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
-          PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-          PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
 
-          //f_ptr[n_dof * owned_cell_id + 3 + s] += (ei - di) + source_ptr[n_dof * owned_cell_id + 3 + s];
-	  f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
+	  PetscReal ei = 0.0;
+          PetscReal di = 0.0;
+
+	  if (tau_critical_erosion > 0.0) {
+            if (tau_b > tau_critical_erosion) {
+              ei = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
+              if (ei < 0.0) ei = 0.0;
+            }
+          }
+
+	  /* deposition only when shear is below deposition threshold */
+	  if (tau_critical_deposition > 0.0) {
+            if (tau_b < tau_critical_deposition) {
+              PetscReal dep_factor = 1.0 - tau_b / tau_critical_deposition; // in (0,1]
+              di = settling_velocity * ci * dep_factor;
+              if (di < 0.0) di = 0.0;
+            }
+          }
+
+          //PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
+          //PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
+
+	  // ei>0 for erosion, di>0 for deposition; net_flux > 0 as source INTO water from bed.
+	  PetscReal net_flux = ei - di; // [kg/m^2/s] or consistent with the hc equation
+				
+          /* ---- Limit deposition so hc can't go negative ----
+             We need: hc_new = hc + dt*(net_flux + external) >= 0.
+             If you want strict positivity ignoring external, at least cap net_flux:
+             net_flux >= -hc/dt.
+          */	  
+	  if (dt > 0.0) {
+            PetscReal min_net_flux = -hc / dt;     // removes at most all available hc
+            if (net_flux < min_net_flux) net_flux = min_net_flux;
+          }
+
+	
+	  // --- Limit erosion by available active-layer mass (per class) ---
+          PetscInt  idx_a = BED_INDEX(0, c, s, ncells, num_sediment_comp);
+          PetscReal M_a   = bed_mass[idx_a]; // active-layer mass for this class
+	
+	  // Proposed bed mass change over dt (negative for erosion, positive for deposition)
+          PetscReal dM_bed_raw = -net_flux * dt;
+
+	  if (dM_bed_raw < 0.0) {
+            // Erosion: cannot erode more than available active mass
+            PetscReal max_erosion = -M_a; // minimum allowed ΔM (negative)
+            if (dM_bed_raw < max_erosion && dM_bed_raw != 0.0) {
+              PetscReal scale = max_erosion / dM_bed_raw; // 0 < scale <= 1
+              net_flux        *= scale;
+              dM_bed_raw       = max_erosion;
+            }
+          }
+
+          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+	  //f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
+	  
+	  // --- Update bed mass in active layer explicitly ---
+          bed_mass[idx_a] += dM_bed_raw;
 
 	  // DEBUG
 	  if (source_ptr[n_dof * owned_cell_id + 3 + s] < 0.0) {
@@ -826,6 +1064,10 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
       f_ptr[n_dof * owned_cell_id + 2] += -bedy - tby + source_ptr[n_dof * owned_cell_id + 2];
     }
   }
+
+  // After updating bed_mass in active layer for all cells,
+  // apply GAIA-style active-layer adjustment (layer 0 <-> layer 1):
+  PetscCall(SedimentUpdateBedActiveLayer2Layer(source_op));
 
   // restore vectors
   PetscCall(VecRestoreArray(u_local, &u_ptr));
@@ -870,6 +1112,9 @@ PetscErrorCode CreateSedimentPetscSourceOperator(RDyMesh *mesh, const RDyConfig 
       .tiny_h            = config.physics.flow.tiny_h,
       .xq2018_threshold  = config.physics.flow.source.xq2018_threshold,
   };
+
+  // --- Initialize 2-layer bed model (active + substrate) ---
+  PetscCall(SedimentInitializeBed(source_op, config));
 
   MPI_Comm comm;
   PetscCall(PetscObjectGetComm((PetscObject)external_sources, &comm));
