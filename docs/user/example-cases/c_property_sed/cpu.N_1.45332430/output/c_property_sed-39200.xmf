@@ -1,0 +1,59 @@
+<?xml version="1.0" ?>
+<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
+<Xdmf>
+  <Domain>
+    <Grid Name="domain">
+      <Time Value="9.800000E+01" />
+      <Topology Type="Mixed" NumberOfElements="800">
+        <DataItem Format="HDF" DataType="int" Dimensions="3200">
+          c_property_sed-grid.h5:/Domain/Cells
+        </DataItem>
+      </Topology>
+      <Geometry GeometryType="XYZ">
+        <DataItem Format="HDF" Dimensions="602 3">
+          c_property_sed-grid.h5:/Domain/Vertices
+        </DataItem>
+      </Geometry>
+      <Attribute Name="XC" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-grid.h5:/fields/XC
+        </DataItem>
+      </Attribute>
+      <Attribute Name="YC" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-grid.h5:/fields/YC
+        </DataItem>
+      </Attribute>
+      <Attribute Name="ZC" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-grid.h5:/fields/ZC
+        </DataItem>
+      </Attribute>
+      <Attribute Name="Area" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-grid.h5:/fields/Area
+        </DataItem>
+      </Attribute>
+      <Attribute Name="Height" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-0.h5:/39200 9.800000E+01 sec/Height
+        </DataItem>
+      </Attribute>
+      <Attribute Name="MomentumX" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-0.h5:/39200 9.800000E+01 sec/MomentumX
+        </DataItem>
+      </Attribute>
+      <Attribute Name="MomentumY" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-0.h5:/39200 9.800000E+01 sec/MomentumY
+        </DataItem>
+      </Attribute>
+      <Attribute Name="Concentration0" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="800" Format="HDF">
+          c_property_sed-0.h5:/39200 9.800000E+01 sec/Concentration0
+        </DataItem>
+      </Attribute>
+    </Grid>
+  </Domain>
+</Xdmf>

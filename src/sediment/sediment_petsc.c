@@ -718,65 +718,68 @@ typedef struct {
   PetscReal tiny_h;             // minimum water height for wet conditions
   PetscReal xq2018_threshold;   // threshold for the XQ2018's implicit time integration of source term
 				
-  // --- 2-layer bed model (active layer + substrate) ---				
-  PetscInt  num_bed_layers;           // fixed to 2 in this scheme
+  // --- multi-layer bed model (active layer + substrate) ---				
+  PetscInt  num_bed_layers;           // 1 active + (num_bed_layers - 1) substrate layers
   PetscReal active_layer_thickness;   // target active-layer thickness [m]
   PetscReal substrate_thickness;      // initial substrate thickness [m]
-  PetscReal *bed_mass;                // size = num_bed_layers * num_cells * num_sediment_comp [kg/m^2]
-  PetscReal *bed_porosity;            // size = num_bed_layers, e.g., {0.4, 0.4}
-  PetscReal *bed_rho_s;               // size = num_sediment_comp, sediment densities [kg/m^3]
+  PetscReal *bed_init_thickness;      // [layer], initial thickness (m), used only at init
+  PetscReal *bed_mass;                // [layer][cell][class] [kg/m^2]
+  PetscReal *bed_porosity;            // [layer], e.g., {0.4, 0.4}
+  PetscReal *bed_rho_s;               // [class], sediment densities [kg/m^3]
 } SedimentSourceOperator;
 
-// layer index: 0 = active layer, 1 = substrate
-// index helper:
+// layer index: 0 = active layer, >=1 = substrate
 #define BED_INDEX(layer, cell, s, num_cells, num_sediment_comp) \
   (((layer) * (num_cells) + (cell)) * (num_sediment_comp) + (s))
 
 
-// Initialize a simple 2-layer bed (active + substrate)
-// For now we use simple defaults;
 static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RDyConfig config) {
   PetscFunctionBeginUser;
 
   RDyMesh  *mesh   = op->mesh;
-  RDyCells *cells  = &mesh->cells;
   PetscInt  ncells = mesh->num_cells;
   PetscInt  ns     = op->num_sediment_comp;
 
-  // Set number of bed layers: 0 = active, 1 = substrate
-  op->num_bed_layers         = 2;
-  op->active_layer_thickness = 0.05;  // [m] example; tune as needed
-  op->substrate_thickness    = 0.1;  // [m] example; tune as needed
+  // ---- User test setup ----
+  PetscInt num_substrate_layers = 3;
+  PetscReal h_sub_init = 0.0;          // each substrate layer thickness (m)
+  op->active_layer_thickness = 0.0;    // target active layer thickness (m) - adjust as desired
 
-  // Allocate porosities for layers
+  op->num_bed_layers = 1 + num_substrate_layers;
+
+  // ---- Allocate porosity per layer ----
   PetscCall(PetscCalloc1(op->num_bed_layers, &op->bed_porosity));
-  op->bed_porosity[0] = 0.4;  // active layer porosity
-  op->bed_porosity[1] = 0.4;  // substrate porosity
+  for (PetscInt L = 0; L < op->num_bed_layers; ++L) op->bed_porosity[L] = 0.4;
 
-  // Allocate sediment densities (per class)
+  // ---- Allocate density per class ----
   PetscCall(PetscCalloc1(ns, &op->bed_rho_s));
-  for (PetscInt s = 0; s < ns; ++s) {
-    op->bed_rho_s[s] = 2650.0;  // [kg/m^3], quartz-like sand; adjust per class if needed
+  for (PetscInt s = 0; s < ns; ++s) op->bed_rho_s[s] = 2650.0;
+
+  // ---- Store initial thicknesses (used only to compute initial mass) ----
+  PetscCall(PetscCalloc1(op->num_bed_layers, &op->bed_init_thickness));
+  op->bed_init_thickness[0] = op->active_layer_thickness;    // active
+  for (PetscInt L = 1; L < op->num_bed_layers; ++L) {
+    op->bed_init_thickness[L] = h_sub_init;                  // each substrate = 0.1 m
   }
 
-  // Allocate bed mass array: [layer][cell][class]
+  // ---- Allocate bed mass array [layer][cell][class] ----
   PetscInt nbed = op->num_bed_layers * ncells * ns;
   PetscCall(PetscCalloc1(nbed, &op->bed_mass));
 
-  // Initialize mass from thickness, porosity, and density
-  // solid_mass = rho_s * (1 - porosity) * thickness
+  // ---- Convert initial thickness -> initial mass (capacity-based) ----
+  // MASS(layer) = rho_s * (1-porosity) * thickness
+  // distribute evenly among classes (or replace with initial fractions)
   for (PetscInt c = 0; c < ncells; ++c) {
-    for (PetscInt s = 0; s < ns; ++s) {
-      PetscReal rho_s  = op->bed_rho_s[s];
+    for (PetscInt L = 0; L < op->num_bed_layers; ++L) {
+      PetscReal hL = op->bed_init_thickness[L];
+      PetscReal por = op->bed_porosity[L];
 
-      PetscReal m_active = rho_s * (1.0 - op->bed_porosity[0]) * op->active_layer_thickness / (PetscReal)ns;
-      PetscReal m_sub    = rho_s * (1.0 - op->bed_porosity[1]) * op->substrate_thickness    / (PetscReal)ns;
+      for (PetscInt s = 0; s < ns; ++s) {
+        PetscReal rho = op->bed_rho_s[s];
+        PetscReal mL  = rho * (1.0 - por) * hL / (PetscReal)ns;
 
-      PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns); // active
-      PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns); // substrate
-
-      op->bed_mass[idx_a] = m_active;
-      op->bed_mass[idx_s] = m_sub;
+        op->bed_mass[BED_INDEX(L, c, s, ncells, ns)] = mL;
+      }
     }
   }
 
@@ -784,115 +787,122 @@ static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RD
 }
 
 
-// GAIA-style active-layer update for a 2-layer bed (active + substrate)
+// GAIA-style active-layer update (active + substrate)
 // Keeps the active layer thickness near op->active_layer_thickness by
-// exchanging mass between layer 0 (active) and layer 1 (substrate).
-static PetscErrorCode SedimentUpdateBedActiveLayer2Layer(SedimentSourceOperator *op) {
+// exchanging mass between layer 0 (active) and substrate layers.
+static PetscErrorCode SedimentUpdateBedActiveLayerMultiLayer(SedimentSourceOperator *op) {
   PetscFunctionBeginUser;
 
   RDyMesh  *mesh   = op->mesh;
-  RDyCells *cells  = &mesh->cells;
   PetscInt  ncells = mesh->num_cells;
   PetscInt  ns     = op->num_sediment_comp;
 
-  PetscReal *M          = op->bed_mass;
-  PetscReal *porosity   = op->bed_porosity;
-  PetscReal *rho_s      = op->bed_rho_s;
-  PetscReal  h_target   = op->active_layer_thickness;
+  PetscInt   nlayers   = op->num_bed_layers;
+  PetscReal *M         = op->bed_mass;
+  PetscReal *porosity  = op->bed_porosity;
+  PetscReal *rho_s     = op->bed_rho_s;
+  PetscReal  h_target  = op->active_layer_thickness;
+
+  // ---- Allocate workspace once (C90-safe) ----
+  PetscReal *h_layer;
+  PetscCall(PetscMalloc1(nlayers, &h_layer));
 
   for (PetscInt c = 0; c < ncells; ++c) {
-    // --- Compute thickness for active (L=0) and substrate (L=1) from mass ---
-    PetscReal h_layer[2] = {0.0, 0.0};
 
-    for (PetscInt L = 0; L < 2; ++L) {
-      PetscReal M_tot    = 0.0;
+    // ---- 1. Compute capacity-based thickness for all layers ----
+    for (PetscInt L = 0; L < nlayers; ++L) {
+
+      PetscReal M_tot = 0.0;
       PetscReal rho_bulk = 0.0;
 
       for (PetscInt s = 0; s < ns; ++s) {
-        PetscInt  idx = BED_INDEX(L, c, s, ncells, ns);
-        PetscReal m   = M[idx];
+        PetscReal m = M[BED_INDEX(L, c, s, ncells, ns)];
+        if (m < 0.0) m = 0.0;
         M_tot += m;
       }
 
-      if (M_tot > 0.0) {
-        for (PetscInt s = 0; s < ns; ++s) {
-          PetscInt  idx = BED_INDEX(L, c, s, ncells, ns);
-          PetscReal m   = M[idx];
-          PetscReal frac = m / M_tot;
-          rho_bulk += frac * rho_s[s];
-        }
-        h_layer[L] = M_tot / (rho_bulk * (1.0 - porosity[L]));
-      } else {
+      if (M_tot <= 0.0) {
         h_layer[L] = 0.0;
+        continue;
       }
+
+      for (PetscInt s = 0; s < ns; ++s) {
+        PetscReal m = M[BED_INDEX(L, c, s, ncells, ns)];
+        if (m < 0.0) m = 0.0;
+        rho_bulk += (m / M_tot) * rho_s[s];
+      }
+
+      h_layer[L] = M_tot / (rho_bulk * (1.0 - porosity[L]));
     }
 
-    PetscReal h_a  = h_layer[0]; // active layer thickness
-    PetscReal h_s  = h_layer[1]; // substrate thickness
-    PetscReal dht  = h_a - h_target;  // THICK_TRANSFER in GAIA
+    PetscReal h_a = h_layer[0];
+    PetscReal dht = h_a - h_target;  // THICK_TRANSFER
 
-    // ---------------------------------------------------------
-    // CASE 1: active layer too thick → push mass from layer 0 → 1
-    // ---------------------------------------------------------
-    if (dht > 0.0 && h_a > 0.0) {
-      PetscReal frac = dht / h_a; // fraction of active layer to move down
+    // --------------------------------------------------
+    // CASE 1: active layer too thick (deposition)
+    // --------------------------------------------------
+    if (dht > 0.0 && h_a > 0.0 && nlayers > 1) {
+
+      PetscReal frac = dht / h_a;
 
       for (PetscInt s = 0; s < ns; ++s) {
         PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
-        PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+        PetscInt idx_1 = BED_INDEX(1, c, s, ncells, ns);
 
         PetscReal dm = frac * M[idx_a];
         if (dm > M[idx_a]) dm = M[idx_a];
 
         M[idx_a] -= dm;
-        M[idx_s] += dm;
+        M[idx_1] += dm;
       }
     }
-    // ---------------------------------------------------------
-    // CASE 2: active layer too thin → pull mass from layer 1 → 0
-    // ---------------------------------------------------------
+    // --------------------------------------------------
+    // CASE 2: active layer too thin (erosion)
+    // --------------------------------------------------
     else if (dht < 0.0) {
-      PetscReal need = -dht;  // thickness to gain in active layer
 
-      // Void ratio correction (RATIO_XKV in GAIA)
-      PetscReal ratio_xkv = (1.0 - porosity[1]) / (1.0 - porosity[0]);
-      PetscReal eff_h_sub = h_s * ratio_xkv;
+      PetscReal need = -dht;
 
-      if (eff_h_sub <= 0.0) continue;
+      for (PetscInt L = 1; L < nlayers && need > 0.0; ++L) {
 
-      if (need >= eff_h_sub) {
-        // We need at least this much: move the entire substrate layer to active
-        for (PetscInt s = 0; s < ns; ++s) {
-          PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
-          PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+        PetscReal ratio_xkv = (1.0 - porosity[L]) / (1.0 - porosity[0]);
+        PetscReal eff_h_L   = h_layer[L] * ratio_xkv;
 
-          PetscReal dm = M[idx_s];
+        if (eff_h_L <= 0.0) continue;
 
-          M[idx_s] -= dm;
-          M[idx_a] += dm;
-        }
-        // We could still be too thin, but with 2 layers there is no deeper bed.
-      } else {
-        // Only need a fraction of the substrate layer
-        PetscReal frac = need / eff_h_sub;
+        if (need >= eff_h_L) {
+          // take entire layer
+          for (PetscInt s = 0; s < ns; ++s) {
+            PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
+            PetscInt idx_L = BED_INDEX(L, c, s, ncells, ns);
+            PetscReal dm   = M[idx_L];
 
-        for (PetscInt s = 0; s < ns; ++s) {
-          PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
-          PetscInt idx_s = BED_INDEX(1, c, s, ncells, ns);
+            M[idx_L] -= dm;
+            M[idx_a] += dm;
+          }
+          need -= eff_h_L;
+        } else {
+          // take fraction of layer
+          PetscReal frac = need / eff_h_L;
 
-          PetscReal dm = frac * M[idx_s];
-          if (dm > M[idx_s]) dm = M[idx_s];
+          for (PetscInt s = 0; s < ns; ++s) {
+            PetscInt idx_a = BED_INDEX(0, c, s, ncells, ns);
+            PetscInt idx_L = BED_INDEX(L, c, s, ncells, ns);
+            PetscReal dm   = frac * M[idx_L];
+            if (dm > M[idx_L]) dm = M[idx_L];
 
-          M[idx_s] -= dm;
-          M[idx_a] += dm;
+            M[idx_L] -= dm;
+            M[idx_a] += dm;
+          }
+          need = 0.0;
         }
       }
     }
   }
 
+  PetscCall(PetscFree(h_layer));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
-
 
 
 /// @brief Set the contribution of the source-term using the semi-implicit time integeration method
@@ -917,7 +927,7 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
   PetscReal               tiny_h            = source_op->tiny_h;
   PetscInt                num_sediment_comp = source_op->num_sediment_comp;
 
-  // 2-layer bed pointers
+  // multi-layer bed pointers
   PetscInt  ncells = mesh->num_cells;
   PetscReal *bed_mass     = source_op->bed_mass;
   PetscReal *bed_porosity = source_op->bed_porosity;
@@ -1066,8 +1076,8 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
   }
 
   // After updating bed_mass in active layer for all cells,
-  // apply GAIA-style active-layer adjustment (layer 0 <-> layer 1):
-  PetscCall(SedimentUpdateBedActiveLayer2Layer(source_op));
+  // adjust the active layer vs substrate (Hirano GAIA-style):
+  PetscCall(SedimentUpdateBedActiveLayerMultiLayer(source_op));
 
   // restore vectors
   PetscCall(VecRestoreArray(u_local, &u_ptr));
@@ -1113,7 +1123,7 @@ PetscErrorCode CreateSedimentPetscSourceOperator(RDyMesh *mesh, const RDyConfig 
       .xq2018_threshold  = config.physics.flow.source.xq2018_threshold,
   };
 
-  // --- Initialize 2-layer bed model (active + substrate) ---
+  // --- Initialize multi-layer bed model (active + substrate) ---
   PetscCall(SedimentInitializeBed(source_op, config));
 
   MPI_Comm comm;
