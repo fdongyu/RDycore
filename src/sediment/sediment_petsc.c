@@ -108,9 +108,10 @@ static PetscErrorCode CreateSedimentRiemannEdgeData(PetscInt num_edges, PetscInt
 /// @param [in]  tiny_h  a height threshold for determining wet/dry cell
 /// @param [out] *data   a SedimentRiemannStateData
 /// @return              0 on success, or a non-zero error code on failure
-static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal tiny_h, SedimentRiemannStateData *data) {
+static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal tiny_h, const PetscReal h_anuga, SedimentRiemannStateData *data) {
   PetscFunctionBeginUser;
 
+  PetscReal denom;
   PetscInt index;
   for (PetscInt n = 0; n < data->num_states; n++) {
     if (data->h[n] < tiny_h) {
@@ -121,8 +122,9 @@ static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal t
         data->ci[index] = 0.0;
       }
     } else {
-      data->u[n] = data->hu[n] / data->h[n];
-      data->v[n] = data->hv[n] / data->h[n];
+      denom      = Square(data->h[n]) + Square(h_anuga);
+      data->u[n] = data->hu[n] * data->h[n] / denom;
+      data->v[n] = data->hv[n] * data->h[n] / denom;
       for (PetscInt s = 0; s < data->num_sediment_comp; s++) {
         index           = n * data->num_sediment_comp + s;
         data->ci[index] = data->hci[index] / data->h[n];
@@ -141,6 +143,7 @@ typedef struct {
   RDyNumericsRiemann       riemann;       // riemann solver type
   RDyMesh                 *mesh;          // domain mesh
   PetscReal                tiny_h;        // minimum water height for wet conditions
+  PetscReal                h_anuga_regular;
   SedimentRiemannStateData left_states;   // "left" riemann states on interior edges
   SedimentRiemannStateData right_states;  // "right" riemann states on interior edges
   SedimentRiemannEdgeData  edges;         // riemann fluxes on interior edges
@@ -213,8 +216,11 @@ static PetscErrorCode ApplySedimentInteriorFlux(void *context, PetscOperatorFiel
 
   // compute diagnostic quantities
   const PetscReal tiny_h = interior_flux_op->tiny_h;
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+  //PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
+  //PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+  const PetscReal h_anuga = interior_flux_op->h_anuga_regular;
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datal));
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datar));
 
   // call Riemann solver
   switch (interior_flux_op->riemann) {
@@ -342,6 +348,7 @@ PetscErrorCode CreateSedimentPetscInteriorFluxOperator(RDyMesh *mesh, const RDyC
       .mesh        = mesh,
       .diagnostics = diagnostics,
       .tiny_h      = config.physics.flow.tiny_h,
+      .h_anuga_regular = config.physics.flow.h_anuga_regular,
   };
 
   // allocate left/right/edge Riemann data structures
@@ -380,6 +387,7 @@ typedef struct {
   Vec                      boundary_fluxes;     // boundary flux values vector
   OperatorDiagnostics     *diagnostics;         // courant number, boundary fluxes
   PetscReal                tiny_h;              // minimum water height for wet conditions
+  PetscReal                h_anuga_regular;
   SedimentRiemannStateData left_states;
   SedimentRiemannStateData right_states;
   SedimentRiemannEdgeData  edges;
@@ -486,7 +494,9 @@ static PetscErrorCode ApplySedimentBoundaryFlux(void *context, PetscOperatorFiel
 
   // compute diagnostic quantities from prognostic variables
   const PetscReal tiny_h = boundary_flux_op->tiny_h;
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
+  //PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
+  const PetscReal h_anuga = boundary_flux_op->h_anuga_regular;
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datal));
 
   // compute the "right" Riemann cell values using the boundary condition
   switch (boundary_condition.flow->type) {
@@ -500,7 +510,8 @@ static PetscErrorCode ApplySedimentBoundaryFlux(void *context, PetscOperatorFiel
           datar->hci[e * num_sediment_comp + s] = boundary_values_ptr[n_dof * e + 3 + s];
         }
       }
-      PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+      //PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+      PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datar));
       break;
     case CONDITION_REFLECTING:
       PetscCall(ApplySedimentReflectingBC(boundary_flux_op->mesh, boundary, datal, datar, data_edge));
@@ -684,6 +695,7 @@ PetscErrorCode CreateSedimentPetscBoundaryFluxOperator(RDyMesh *mesh, const RDyC
       .boundary_fluxes    = boundary_fluxes,
       .diagnostics        = diagnostics,
       .tiny_h             = config.physics.flow.tiny_h,
+      .h_anuga_regular    = config.physics.flow.h_anuga_regular,
   };
 
   // allocate left/right/edge Riemann data structures
@@ -742,8 +754,8 @@ static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RD
 
   // ---- User test setup ----
   PetscInt num_substrate_layers = 3;
-  PetscReal h_sub_init = 0.0;          // each substrate layer thickness (m)
-  op->active_layer_thickness = 0.0;    // target active layer thickness (m) - adjust as desired
+  PetscReal h_sub_init = 0.05;          // each substrate layer thickness (m)
+  op->active_layer_thickness = 0.01;    // target active layer thickness (m) - adjust as desired
 
   op->num_bed_layers = 1 + num_substrate_layers;
 
@@ -935,11 +947,12 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 
   // FIXME: Need to move these constants into a struct that is specific to the erosion/deposition
   // parameterization
-  const PetscReal kp_constant             = 4.e-06;
-  const PetscReal settling_velocity       = 5.e-04;
-  const PetscReal tau_critical_erosion    = 0.25;
-  const PetscReal tau_critical_deposition = 0.08;
+  const PetscReal kp_constant             = 4.e-06; // 4.e-06
+  const PetscReal settling_velocity       = 1.e-02; // 5.e-04
+  const PetscReal tau_critical_erosion    = 2.0;    // 0.25
+  const PetscReal tau_critical_deposition = 0.2;    // 0.08
   const PetscReal rhow                    = DENSITY_OF_WATER;
+  const PetscReal h_sed_min = PetscMax(1e-1, 10.0 * tiny_h); // Sediment wetting threshold (separate from tiny_h used by SWE), if h is too shallow for sediment physics, we skip erosion and deposition and only apply the external source term to hC
 
   // access Vec data
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
@@ -994,6 +1007,16 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
+	// ------------------------------------------------------------
+        // NEW: Sediment physics only if water depth is sufficiently wet
+        // ------------------------------------------------------------
+	if (h < h_sed_min) {
+	  // Too shallow: no erosion/deposition; only external sediment source
+          for (PetscInt s = 0; s < num_sediment_comp; s++) {
+            f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
+          }
+        } else {
+
         for (PetscInt s = 0; s < num_sediment_comp; s++) {
 	  PetscInt  owned_id = owned_cell_id;
 	  PetscReal hc = u_ptr[n_dof * c + 3 + s];
@@ -1039,6 +1062,7 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 	  // --- Limit erosion by available active-layer mass (per class) ---
           PetscInt  idx_a = BED_INDEX(0, c, s, ncells, num_sediment_comp);
           PetscReal M_a   = bed_mass[idx_a]; // active-layer mass for this class
+	  if (PetscIsInfOrNanReal(M_a) || M_a < 0.0) M_a = 0.0;
 	
 	  // Proposed bed mass change over dt (negative for erosion, positive for deposition)
           PetscReal dM_bed_raw = -net_flux * dt;
@@ -1066,6 +1090,8 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
           //
 	  
         }
+      }
+
       }
 
       // NOTE: we accumulate everything into the RHS vector by convention.
