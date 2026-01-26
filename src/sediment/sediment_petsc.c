@@ -952,7 +952,7 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
   const PetscReal tau_critical_erosion    = 2.0;    // 0.25
   const PetscReal tau_critical_deposition = 0.2;    // 0.08
   const PetscReal rhow                    = DENSITY_OF_WATER;
-  const PetscReal h_sed_min = PetscMax(1e-1, 10.0 * tiny_h); // Sediment wetting threshold (separate from tiny_h used by SWE), if h is too shallow for sediment physics, we skip erosion and deposition and only apply the external source term to hC
+  const PetscReal h_ero_min = PetscMax(1e-1, 10.0 * tiny_h); // Sediment wetting threshold (separate from tiny_h used by SWE), if h is too shallow for sediment physics, we skip erosion
 
   // access Vec data
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
@@ -1007,15 +1007,6 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-	// ------------------------------------------------------------
-        // NEW: Sediment physics only if water depth is sufficiently wet
-        // ------------------------------------------------------------
-	if (h < h_sed_min) {
-	  // Too shallow: no erosion/deposition; only external sediment source
-          for (PetscInt s = 0; s < num_sediment_comp; s++) {
-            f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
-          }
-        } else {
 
         for (PetscInt s = 0; s < num_sediment_comp; s++) {
 	  PetscInt  owned_id = owned_cell_id;
@@ -1026,7 +1017,8 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 	  PetscReal ei = 0.0;
           PetscReal di = 0.0;
 
-	  if (tau_critical_erosion > 0.0) {
+	  /* Erosion only if deep enough */
+          if (h >= h_ero_min && tau_critical_erosion > 0.0) {
             if (tau_b > tau_critical_erosion) {
               ei = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
               if (ei < 0.0) ei = 0.0;
@@ -1078,7 +1070,6 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
           }
 
           f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
-	  //f_ptr[n_dof * owned_cell_id + 3 + s] += source_ptr[n_dof * owned_cell_id + 3 + s];
 	  
 	  // --- Update bed mass in active layer explicitly ---
           bed_mass[idx_a] += dM_bed_raw;
@@ -1092,7 +1083,6 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
         }
       }
 
-      }
 
       // NOTE: we accumulate everything into the RHS vector by convention.
       f_ptr[n_dof * owned_cell_id + 0] += source_ptr[n_dof * owned_cell_id + 0];
