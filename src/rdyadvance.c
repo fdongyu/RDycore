@@ -9,6 +9,121 @@
 extern PetscReal ConvertTimeToSeconds(PetscReal time, RDyTimeUnit time_unit);
 extern PetscReal ConvertTimeFromSeconds(PetscReal time, RDyTimeUnit time_unit);
 
+// DEBUG
+void     SedBndFluxReset(void);
+void     SedBndFluxAccumulate(PetscReal v); // (not used here, but fine to declare)
+PetscReal SedBndFluxTake(void);
+
+// FIX ---- Sum A * RHS_hC over owned cells (for current RHS vector) --------------
+static PetscErrorCode RDySumSedimentRHS(Vec F_local, RDy rdy, PetscInt sed_ncomp, PetscReal *dMdt_out) {
+  PetscFunctionBegin;
+  PetscInt n_dof = 0;
+  PetscCall(VecGetBlockSize(F_local, &n_dof));
+  *dMdt_out = 0.0;
+  if (n_dof < 3 || sed_ncomp <= 0) PetscFunctionReturn(PETSC_SUCCESS);
+
+  RDyMesh *mesh = &rdy->mesh;
+  const RDyCells *cells = &mesh->cells;
+
+  const PetscScalar *f = NULL;
+  PetscCall(VecGetArrayRead(F_local, &f));
+  PetscReal dMdt_loc = 0.0;
+
+  for (PetscInt lc = 0; lc < mesh->num_cells; ++lc) {
+    if (!cells->is_owned[lc]) continue;
+    const PetscReal A = cells->areas[lc];
+    for (PetscInt s = 0; s < sed_ncomp; ++s) {
+      const PetscReal rhs_hC = (PetscReal)f[n_dof*lc + 3 + s];
+      dMdt_loc += A * rhs_hC;
+    }
+  }
+  PetscCall(VecRestoreArrayRead(F_local, &f));
+
+  MPI_Comm comm;
+  PetscCall(PetscObjectGetComm((PetscObject)F_local, &comm));
+  PetscReal dMdt_glob = 0.0;
+  PetscCall(MPIU_Allreduce(&dMdt_loc, &dMdt_glob, 1, MPIU_REAL, MPIU_SUM, comm));
+  *dMdt_out = dMdt_glob;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+// ---- Compute total tracer mass (sum A * hC) over owned cells ----------------
+static PetscErrorCode RDyMassSediment(Vec X, RDy rdy, PetscInt sed_ncomp, PetscReal *M_out) {
+  PetscFunctionBegin;
+  PetscInt n_dof = 0;
+  PetscCall(VecGetBlockSize(X, &n_dof));
+  *M_out = 0.0;
+  if (n_dof < 3 || sed_ncomp <= 0) PetscFunctionReturn(PETSC_SUCCESS);
+
+  RDyMesh *mesh = &rdy->mesh;
+  const RDyCells *cells = &mesh->cells;
+
+  const PetscScalar *x = NULL;
+  PetscCall(VecGetArrayRead(X, &x));
+  PetscReal Mloc = 0.0;
+
+  for (PetscInt lc = 0; lc < mesh->num_cells; ++lc) {
+    if (!cells->is_owned[lc]) continue;
+    const PetscReal A = cells->areas[lc];
+    for (PetscInt s = 0; s < sed_ncomp; ++s) {
+      const PetscReal hC = (PetscReal)x[n_dof*lc + 3 + s];
+      Mloc += A * hC;
+    }
+  }
+  PetscCall(VecRestoreArrayRead(X, &x));
+
+  MPI_Comm comm;
+  PetscCall(PetscObjectGetComm((PetscObject)X, &comm));
+  PetscCall(MPIU_Allreduce(&Mloc, M_out, 1, MPIU_REAL, MPIU_SUM, comm));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+// ---- Sediment mass accumulation context (for TS monitor) -------------------
+typedef struct {
+  RDy        rdy;            // needed for mesh & layout
+  PetscInt   sed_ncomp;      // number of sediment components (n_dof - 3)
+  PetscReal  M_start;        // mass at start of window
+  PetscReal  dM_pred_accum;  // sum over steps of dt * Σ_i A_i * RHS_hC(i)
+  PetscReal  bnd_flux_accum; // ∑ dt * Σ_edges L_e * F_{hC,e}
+} SedMassCtx;
+
+static PetscErrorCode MonitorSedimentMassAccum(TS ts, PetscInt step, PetscReal time, Vec X, void *ctx) {
+  PetscFunctionBegin;
+  SedMassCtx *mc = (SedMassCtx*)ctx;
+
+  SedBndFluxReset();
+
+  // Build RHS at this (time, X)
+  Vec F_rhs = NULL;
+  PetscCall(VecDuplicate(X, &F_rhs));
+  PetscCall(TSComputeRHSFunction(ts, time, X, F_rhs));
+
+  // Sum A * RHS_hC over owned cells
+  PetscReal dMdt = 0.0;
+  PetscCall(RDySumSedimentRHS(F_rhs, mc->rdy, mc->sed_ncomp, &dMdt));
+  PetscCall(VecDestroy(&F_rhs));
+
+  // Accumulate with this step's dt
+  PetscReal dt = 0.0;
+  PetscCall(TSGetTimeStep(ts, &dt));
+
+  PetscReal bnd_step_loc = SedBndFluxTake();  /* local mass per second */
+  MPI_Comm  comm_step;
+  PetscCall(PetscObjectGetComm((PetscObject)mc->rdy->u_global, &comm_step));
+  PetscReal bnd_step_glob = 0.0;
+  PetscCall(MPIU_Allreduce(&bnd_step_loc, &bnd_step_glob, 1, MPIU_REAL, MPIU_SUM, comm_step));
+
+  /* Integrate */
+  mc->dM_pred_accum  += dMdt * dt;
+  mc->bnd_flux_accum += bnd_step_glob * dt;
+
+  //PetscCall(PetscPrintf(comm_step, "[BND-step] global Σ L*F_hC = %.6e  dt = %.3e  add = %.6e\n",
+  //                    bnd_step_glob, dt, bnd_step_glob*dt));
+
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /// Returns the name of the output directory:
 /// * <output_dir>                         (single-run mode)
 /// * <output_dir>/<ensemble-member-name>" (ensemble mode)
@@ -349,6 +464,23 @@ PetscErrorCode RDyAdvance(RDy rdy) {
 
   PetscCall(ResetOperatorDiagnostics(rdy->operator));
 
+
+  // FIX sediment budget check
+  PetscInt n_dof = 0;
+  PetscCall(VecGetBlockSize(rdy->u_global, &n_dof));
+  PetscInt sed_ncomp = (n_dof >= 3) ? (n_dof - 3) : 0;
+
+  SedMassCtx mc;
+  mc.rdy           = rdy;
+  mc.sed_ncomp     = sed_ncomp;
+  mc.dM_pred_accum = 0.0;
+  mc.bnd_flux_accum = 0.0;
+  PetscCall(RDyMassSediment(rdy->u_global, rdy, sed_ncomp, &mc.M_start));
+
+  // Register the monitor with our context
+  PetscCall(TSMonitorSet(rdy->ts, MonitorSedimentMassAccum, &mc, NULL));
+
+
   // advance the solution to the specified time (handling preloading if requested)
   PetscPreLoadBegin(PETSC_FALSE, "RDyAdvance solve");
   if (PetscPreLoadingOn) {
@@ -359,6 +491,19 @@ PetscErrorCode RDyAdvance(RDy rdy) {
     PetscCall(TSSolve(rdy->ts, rdy->u_global));
   }
   PetscPreLoadEnd();
+
+
+  // FIX sediment budget check, Compare actual vs predicted mass change over the entire window
+  PetscReal M_end = 0.0;
+  PetscCall(RDyMassSediment(rdy->u_global, rdy, sed_ncomp, &M_end));
+
+  // Report apples-to-apples comparison over this window
+  MPI_Comm comm;
+  PetscCall(PetscObjectGetComm((PetscObject)rdy->u_global, &comm));
+  PetscCall(PetscPrintf(comm,
+    "[SEDIMENT-MASS] window: M_start=%.15e  M_end=%.15e  dM_actual=%.15e  dM_pred(sum dt*ΣA*RHS)=%.15e bnd(dt*Σ L*F_hC)=%.15e\n",
+    mc.M_start, M_end, (M_end - mc.M_start), mc.dM_pred_accum, mc.bnd_flux_accum));
+
 
   if (time_adapt->enable) {
     OperatorDiagnostics diagnostics;
