@@ -1007,23 +1007,41 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
+	PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
+
+        /* total erosion flux (apply ONCE per cell) */
+        PetscReal E_total = 0.0;
+        if (h >= h_ero_min && tau_critical_erosion > 0.0 && tau_b > tau_critical_erosion) {
+          E_total = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
+          if (E_total < 0.0) E_total = 0.0;
+        }
+
+        /* compute active-layer total mass across classes (for partitioning) */
+        PetscReal Mtot_a = 0.0;
+        for (PetscInt ss = 0; ss < num_sediment_comp; ++ss) {
+          PetscInt idx_a = BED_INDEX(0, c, ss, ncells, num_sediment_comp);
+          PetscReal M_a  = bed_mass[idx_a];
+          if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
+        }
 
         for (PetscInt s = 0; s < num_sediment_comp; s++) {
           PetscInt  owned_id = owned_cell_id;
 	  PetscReal hc = u_ptr[n_dof * c + 3 + s];
           PetscReal ci    = hc / h;
-          PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
 
-	  PetscReal ei = 0.0;
           PetscReal di = 0.0;
 
-	  /* Erosion only if deep enough */
-          if (h >= h_ero_min && tau_critical_erosion > 0.0) {
-            if (tau_b > tau_critical_erosion) {
-              ei = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-              if (ei < 0.0) ei = 0.0;
-            }
+	  /* partition E_total into class s */
+          PetscReal frac_s = 1.0 / (PetscReal)num_sediment_comp;
+          if (Mtot_a > 0.0) {
+            PetscInt  idx_a_s = BED_INDEX(0, c, s, ncells, num_sediment_comp);
+            PetscReal M_a_s   = bed_mass[idx_a_s];
+            if (PetscIsInfOrNanReal(M_a_s) || M_a_s < 0.0) M_a_s = 0.0;
+            frac_s = M_a_s / Mtot_a;
           }
+
+          PetscReal ei = E_total * frac_s;
+
 
 	  /* deposition only when shear is below deposition threshold */
 	  if (tau_critical_deposition > 0.0) {
