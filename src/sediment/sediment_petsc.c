@@ -947,12 +947,31 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 
   // FIXME: Need to move these constants into a struct that is specific to the erosion/deposition
   // parameterization
-  const PetscReal kp_constant             = 4.e-06; // 4.e-06
-  const PetscReal settling_velocity       = 1.e-02; // 5.e-04
-  const PetscReal tau_critical_erosion    = 2.0;    // 0.25
-  const PetscReal tau_critical_deposition = 0.2;    // 0.08
+  //const PetscReal kp_constant             = 4.e-06; // 4.e-06
+  //const PetscReal settling_velocity       = 1.e-02; // 5.e-04
+  //const PetscReal tau_critical_erosion    = 2.0;    // 0.25
+  //const PetscReal tau_critical_deposition = 0.2;    // 0.08
   const PetscReal rhow                    = DENSITY_OF_WATER;
   const PetscReal h_ero_min = PetscMax(1e-1, 10.0 * tiny_h); // Sediment wetting threshold (separate from tiny_h used by SWE), if h is too shallow for sediment physics, we skip erosion
+							     
+  static const PetscReal kp_constant_by_class[] = {4.e-06, 4.e-06, 4.e-06};
+  static const PetscReal settling_velocity_by_class[] = {1.e-02, 1.e-02, 1.e-02};
+  static const PetscReal tau_critical_erosion_by_class[] = {2.0, 2.0, 2.0};
+  static const PetscReal tau_critical_deposition_by_class[] = {0.2, 0.2, 0.2};
+  const PetscInt nparam_kp = (PetscInt)(sizeof(kp_constant_by_class) / sizeof(kp_constant_by_class[0]));
+  const PetscInt nparam_ws = (PetscInt)(sizeof(settling_velocity_by_class) / sizeof(settling_velocity_by_class[0]));
+  const PetscInt nparam_te = (PetscInt)(sizeof(tau_critical_erosion_by_class) / sizeof(tau_critical_erosion_by_class[0]));
+  const PetscInt nparam_td = (PetscInt)(sizeof(tau_critical_deposition_by_class) / sizeof(tau_critical_deposition_by_class[0]));
+  PetscCheck(nparam_kp == nparam_ws && nparam_kp == nparam_te && nparam_kp == nparam_td, comm, PETSC_ERR_USER,
+             "Hard-coded sediment parameter arrays have inconsistent lengths: kp=%" PetscInt_FMT ", ws=%" PetscInt_FMT
+             ", tau_e=%" PetscInt_FMT ", tau_d=%" PetscInt_FMT ". Fix the *_by_class initializers.",
+             nparam_kp, nparam_ws, nparam_te, nparam_td);
+
+  PetscCheck(num_sediment_comp == nparam_kp, comm, PETSC_ERR_USER,
+             "Hard-coded sediment parameter arrays expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT
+             ". Update the *_by_class initializers in ApplySedimentSourceSemiImplicit().",
+             nparam_kp, num_sediment_comp);
+
 
   // access Vec data
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
@@ -1009,18 +1028,11 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 
 	PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
 
-        /* total erosion flux (apply ONCE per cell) */
-        PetscReal E_total = 0.0;
-        if (h >= h_ero_min && tau_critical_erosion > 0.0 && tau_b > tau_critical_erosion) {
-          E_total = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-          if (E_total < 0.0) E_total = 0.0;
-        }
-
-        /* compute active-layer total mass across classes (for partitioning) */
+	/* Active-layer total mass across classes for partitioning */
         PetscReal Mtot_a = 0.0;
         for (PetscInt ss = 0; ss < num_sediment_comp; ++ss) {
-          PetscInt idx_a = BED_INDEX(0, c, ss, ncells, num_sediment_comp);
-          PetscReal M_a  = bed_mass[idx_a];
+          PetscInt  idx_a = BED_INDEX(0, c, ss, ncells, num_sediment_comp);
+          PetscReal M_a   = bed_mass[idx_a];
           if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
         }
 
@@ -1029,9 +1041,12 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 	  PetscReal hc = u_ptr[n_dof * c + 3 + s];
           PetscReal ci    = hc / h;
 
-          PetscReal di = 0.0;
+	  PetscReal kp_s    = kp_constant_by_class[s];
+          PetscReal ws_s    = settling_velocity_by_class[s];
+          PetscReal tau_e_s = tau_critical_erosion_by_class[s];
+          PetscReal tau_d_s = tau_critical_deposition_by_class[s];
 
-	  /* partition E_total into class s */
+          /* Bed fraction for this class (default equal if bed is empty) */
           PetscReal frac_s = 1.0 / (PetscReal)num_sediment_comp;
           if (Mtot_a > 0.0) {
             PetscInt  idx_a_s = BED_INDEX(0, c, s, ncells, num_sediment_comp);
@@ -1040,20 +1055,23 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
             frac_s = M_a_s / Mtot_a;
           }
 
-          PetscReal ei = E_total * frac_s;
+	  PetscReal ei = 0.0;
+          PetscReal di = 0.0;
 
-
-	  /* deposition only when shear is below deposition threshold */
-	  if (tau_critical_deposition > 0.0) {
-            if (tau_b < tau_critical_deposition) {
-              PetscReal dep_factor = 1.0 - tau_b / tau_critical_deposition; // in (0,1]
-              di = settling_velocity * ci * dep_factor;
-              if (di < 0.0) di = 0.0;
-            }
+	  /* Erosion: class-dependent threshold/erodibility, scaled by bed fraction */
+          if (h >= h_ero_min && tau_e_s > 0.0 && tau_b > tau_e_s) {
+            PetscReal e0 = kp_s * (tau_b - tau_e_s) / tau_e_s;
+            if (e0 < 0.0) e0 = 0.0;
+            ei = frac_s * e0;
           }
 
-          //PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-          //PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
+	  /* Deposition: class-dependent settling + class-dependent deposition threshold */
+          if (tau_d_s > 0.0 && tau_b < tau_d_s) {
+            PetscReal dep_factor = 1.0 - tau_b / tau_d_s;     // (0,1]
+            di = ws_s * ci * dep_factor;
+            if (di < 0.0) di = 0.0;
+          }
+
 
 	  // ei>0 for erosion, di>0 for deposition; net_flux > 0 as source INTO water from bed.
 	  PetscReal net_flux = ei - di; // [kg/m^2/s] or consistent with the hc equation
