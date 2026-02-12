@@ -12,6 +12,16 @@ void SedBndFluxReset(void)            { s_bnd_flux_inst = 0.0; }
 void SedBndFluxAccumulate(PetscReal v){ s_bnd_flux_inst += v; }
 PetscReal SedBndFluxTake(void)        { PetscReal v = s_bnd_flux_inst; s_bnd_flux_inst = 0.0; return v; }
 
+// -----------------------------------------------------------------------------
+// Default initial bed composition fractions (by sediment class).
+// Used in:
+//   (1) SedimentInitializeBed(): initial bed_mass distribution
+//   (2) ApplySedimentSourceSemiImplicit(): fallback partition when active layer is empty
+// Must have num_sediment_comp entries and sum to 1.0.
+// TODO: make this read from YAML
+// -----------------------------------------------------------------------------
+static const PetscReal frac_init_by_class[] = {0.05, 0.15, 0.80};
+
 /// @brief Allocates memory for prognostic (h/hu/hv/hci) and diagnostic (u/v/ci) variables stored at
 ///        cell centers for sediment dynamics
 /// @param [in]  num_states        number of states
@@ -752,6 +762,22 @@ static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RD
   PetscInt  ncells = mesh->num_cells;
   PetscInt  ns     = op->num_sediment_comp;
 
+  
+  // ---- Initial bed composition fractions check ----
+  const PetscInt nfrac = (PetscInt)(sizeof(frac_init_by_class) / sizeof(frac_init_by_class[0]));
+  PetscCheck(nfrac == ns, PETSC_COMM_SELF, PETSC_ERR_ARG_SIZ,
+             "frac_init_by_class has %D entries but num_sediment_comp = %D", nfrac, ns);
+
+  PetscReal frac_sum = 0.0;
+  for (PetscInt s = 0; s < ns; ++s) {
+    PetscCheck(frac_init_by_class[s] >= 0.0, PETSC_COMM_SELF, PETSC_ERR_ARG_OUTOFRANGE,
+               "frac_init_by_class[%D]=%g must be >= 0", s, (double)frac_init_by_class[s]);
+    frac_sum += frac_init_by_class[s];
+  }
+  PetscCheck(PetscAbsReal(frac_sum - 1.0) < 1e-12, PETSC_COMM_SELF, PETSC_ERR_ARG_OUTOFRANGE,
+             "frac_init_by_class must sum to 1.0 (got %g)", (double)frac_sum);
+
+
   // ---- User test setup ----
   PetscInt num_substrate_layers = 3;
   PetscReal h_sub_init = 0.05;          // each substrate layer thickness (m)
@@ -788,7 +814,7 @@ static PetscErrorCode SedimentInitializeBed(SedimentSourceOperator *op, const RD
 
       for (PetscInt s = 0; s < ns; ++s) {
         PetscReal rho = op->bed_rho_s[s];
-        PetscReal mL  = rho * (1.0 - por) * hL / (PetscReal)ns;
+	PetscReal mL  = rho * (1.0 - por) * hL * frac_init_by_class[s];
 
         op->bed_mass[BED_INDEX(L, c, s, ncells, ns)] = mL;
       }
@@ -954,10 +980,10 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
   const PetscReal rhow                    = DENSITY_OF_WATER;
   const PetscReal h_ero_min = PetscMax(1e-1, 10.0 * tiny_h); // Sediment wetting threshold (separate from tiny_h used by SWE), if h is too shallow for sediment physics, we skip erosion
 							     
-  static const PetscReal kp_constant_by_class[] = {4.e-06, 4.e-06, 4.e-06};
-  static const PetscReal settling_velocity_by_class[] = {1.e-02, 1.e-02, 1.e-02};
-  static const PetscReal tau_critical_erosion_by_class[] = {2.0, 2.0, 2.0};
-  static const PetscReal tau_critical_deposition_by_class[] = {0.2, 0.2, 0.2};
+  static const PetscReal kp_constant_by_class[] = {4.e-06, 1.6e-05, 4.e-05};
+  static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
+  static const PetscReal tau_critical_erosion_by_class[] = {1.5, 1.5, 2.0};
+  static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
   const PetscInt nparam_kp = (PetscInt)(sizeof(kp_constant_by_class) / sizeof(kp_constant_by_class[0]));
   const PetscInt nparam_ws = (PetscInt)(sizeof(settling_velocity_by_class) / sizeof(settling_velocity_by_class[0]));
   const PetscInt nparam_te = (PetscInt)(sizeof(tau_critical_erosion_by_class) / sizeof(tau_critical_erosion_by_class[0]));
@@ -971,6 +997,19 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
              "Hard-coded sediment parameter arrays expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT
              ". Update the *_by_class initializers in ApplySedimentSourceSemiImplicit().",
              nparam_kp, num_sediment_comp);
+
+
+  // ---- Ensure frac_init_by_class matches num_sediment_comp ----
+  const PetscInt nfrac_init = (PetscInt)(sizeof(frac_init_by_class) / sizeof(frac_init_by_class[0]));
+  PetscCheck(nfrac_init == num_sediment_comp, comm, PETSC_ERR_USER,
+             "frac_init_by_class has %" PetscInt_FMT " entries but num_sediment_comp=%" PetscInt_FMT
+             ". Update frac_init_by_class[] in sediment_petsc.c.",
+             nfrac_init, num_sediment_comp);
+
+  PetscReal frac_sum2 = 0.0;
+  for (PetscInt s = 0; s < num_sediment_comp; ++s) frac_sum2 += frac_init_by_class[s];
+  PetscCheck(PetscAbsReal(frac_sum2 - 1.0) < 1e-12, comm, PETSC_ERR_USER,
+             "frac_init_by_class must sum to 1.0 (got %g)", (double)frac_sum2);
 
 
   // access Vec data
@@ -1046,8 +1085,11 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
           PetscReal tau_e_s = tau_critical_erosion_by_class[s];
           PetscReal tau_d_s = tau_critical_deposition_by_class[s];
 
-          /* Bed fraction for this class (default equal if bed is empty) */
-          PetscReal frac_s = 1.0 / (PetscReal)num_sediment_comp;
+	  /* Bed fraction for this class:
+             - if active layer has mass: use current bed composition
+             - else (active layer empty): use configured initial fractions
+          */
+	  PetscReal frac_s = frac_init_by_class[s];
           if (Mtot_a > 0.0) {
             PetscInt  idx_a_s = BED_INDEX(0, c, s, ncells, num_sediment_comp);
             PetscReal M_a_s   = bed_mass[idx_a_s];
