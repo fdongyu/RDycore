@@ -1012,6 +1012,22 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
              "frac_init_by_class must sum to 1.0 (got %g)", (double)frac_sum2);
 
 
+  // ---------------------------------------------------------------------------
+  // Sediment IC-relaxation spin-up:
+  // Disable bed exchange (erosion + deposition) for an initial window so the
+  // hydraulic adjustment from the initial water distribution does not mine the bed.
+  //
+  // Time accounting:
+  //   - Uses the dt argument passed by the RDycore time integrator.
+  //   - Works with variable dt as well (we accumulate whatever dt is passed in).
+  // ---------------------------------------------------------------------------
+  static PetscReal sed_elapsed_time = 0.0;
+  if (dt > 0.0) sed_elapsed_time += dt;
+
+  // Hard coded sediment spin-up time:
+  const PetscReal sed_spinup_seconds = 144.0 * 3600.0;  // 72 hours
+  const PetscReal sed_exchange_scale = (sed_elapsed_time < sed_spinup_seconds) ? 0.0 : 1.0;
+
   // access Vec data
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));      // sequential vector
@@ -1113,6 +1129,10 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
             di = ws_s * ci * dep_factor;
             if (di < 0.0) di = 0.0;
           }
+	  
+	  // ---- Sediment spin-up ----
+	  ei *= sed_exchange_scale;
+          di *= sed_exchange_scale;
 
 
 	  // ei>0 for erosion, di>0 for deposition; net_flux > 0 as source INTO water from bed.
@@ -1172,7 +1192,10 @@ static PetscErrorCode ApplySedimentSourceSemiImplicit(void *context, PetscOperat
 
   // After updating bed_mass in active layer for all cells,
   // adjust the active layer vs substrate (Hirano GAIA-style):
-  PetscCall(SedimentUpdateBedActiveLayerMultiLayer(source_op));
+  //PetscCall(SedimentUpdateBedActiveLayerMultiLayer(source_op));
+  if (sed_exchange_scale > 0.0) {
+    PetscCall(SedimentUpdateBedActiveLayerMultiLayer(source_op));
+  }
 
   // restore vectors
   PetscCall(VecRestoreArray(u_local, &u_ptr));
