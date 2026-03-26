@@ -34,5 +34,6 @@ function(extract_mpi_include_directories directories)
   endif()
 
   # Neither variable found
-  message(FATAL_ERROR "Could not find MPI include directories from PETSc (neither MPICXX_INCLUDES nor MPICC_SHOW available).")
+  message(WARNING "Could not find MPI include directories from PETSc (neither MPICXX_INCLUDES nor MPICC_SHOW available).")
+  set( "" PARENT_SCOPE)
 endfunction()
