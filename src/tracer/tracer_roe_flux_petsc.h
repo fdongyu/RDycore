@@ -97,44 +97,26 @@ static PetscErrorCode ComputeTracerRoeFlux(TracerRiemannStateData *datal, Tracer
     FR[2] = vr[i] * uperpr * hr[i] + 0.5 * GRAVITY * hr[i] * hr[i] * sn[i];
 
     ci_index_offset = i * tracers_ncomp;
-
-    /*
     for (PetscInt j = 0; j < tracers_ncomp; j++) {
       FL[j + 3] = hl[i] * uperpl * cil[ci_index_offset + j];
       FR[j + 3] = hr[i] * uperpr * cir[ci_index_offset + j];
     }
 
-    // fij = 0.5*(FL + FR - matmul(R,matmul(A,dW))
-    for (PetscInt dof1 = 0; dof1 < soln_ncomp; dof1++) {
-      for (PetscInt dof2 = 0; dof2 < soln_ncomp; dof2++) {
-        if (dof2 == 0) {
-          fij[soln_ncomp * i + dof1] = 0.5 * (FL[dof1] + FR[dof1]);
-        }
-        fij[soln_ncomp * i + dof1] = fij[soln_ncomp * i + dof1] - 0.5 * R[dof1][dof2] * A[dof2] * dW[dof2];
-      }
-    }
-    */
-
     PetscReal Fh_num_roe = 0.5 * (FL[0] + FR[0])
-                         - 0.5 * ( R_swe[0][0]*A_swe[0]*dW_swe[0]
-                                 + R_swe[0][1]*A_swe[1]*dW_swe[1]
-                                 + R_swe[0][2]*A_swe[2]*dW_swe[2] );
+                         - 0.5 * (R_swe[0][0] * A_swe[0] * dW_swe[0] + R_swe[0][1] * A_swe[1] * dW_swe[1] +
+                                  R_swe[0][2] * A_swe[2] * dW_swe[2]);
 
     for (PetscInt dof1 = 0; dof1 < 3; dof1++) {
       PetscReal Fnum = 0.5 * (FL[dof1] + FR[dof1])
-                     - 0.5 * ( R_swe[dof1][0]*A_swe[0]*dW_swe[0]
-                             + R_swe[dof1][1]*A_swe[1]*dW_swe[1]
-                             + R_swe[dof1][2]*A_swe[2]*dW_swe[2] );
+                     - 0.5 * (R_swe[dof1][0] * A_swe[0] * dW_swe[0] + R_swe[dof1][1] * A_swe[1] * dW_swe[1] +
+                              R_swe[dof1][2] * A_swe[2] * dW_swe[2]);
       fij[soln_ncomp * i + dof1] = Fnum;
     }
 
     for (PetscInt j = 0; j < tracers_ncomp; j++) {
-      // upwind concentration by the sign of the *hydro mass flux*
-      PetscReal cL = cil[ci_index_offset + j];
-      PetscReal cR = cir[ci_index_offset + j];
+      PetscReal cL  = cil[ci_index_offset + j];
+      PetscReal cR  = cir[ci_index_offset + j];
       PetscReal Cup = (Fh_num_roe >= 0.0) ? cL : cR;
-
-      // Final sediment (hC) flux on this face and class j
       fij[soln_ncomp * i + (3 + j)] = Fh_num_roe * Cup;
     }
 
