@@ -7,6 +7,173 @@
 
 #include "tracer_roe_flux_petsc.h"
 
+static const PetscReal frac_init_by_class[] = {0.05, 0.15, 0.80};
+static const PetscReal kp_constant_by_class[] = {4.e-06, 1.6e-05, 4.e-05};
+static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
+static const PetscReal tau_critical_erosion_by_class[] = {1.5, 1.5, 2.0};
+static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
+
+typedef struct {
+  PetscInt  num_bed_layers;
+  PetscReal active_layer_thickness;
+  PetscReal *bed_init_thickness;
+  PetscReal *bed_mass;
+  PetscReal *bed_porosity;
+  PetscReal *bed_rho_s;
+} TracerBedModel;
+
+#define BED_INDEX(layer, cell, s, num_cells, num_tracers_comp) (((layer) * (num_cells) + (cell)) * (num_tracers_comp) + (s))
+
+static PetscErrorCode CheckTracerClassTables(PetscInt num_tracers_comp, MPI_Comm comm) {
+  PetscFunctionBeginUser;
+
+  const PetscInt nfrac = (PetscInt)(sizeof(frac_init_by_class) / sizeof(frac_init_by_class[0]));
+  const PetscInt nkp   = (PetscInt)(sizeof(kp_constant_by_class) / sizeof(kp_constant_by_class[0]));
+  const PetscInt nws   = (PetscInt)(sizeof(settling_velocity_by_class) / sizeof(settling_velocity_by_class[0]));
+  const PetscInt nte   = (PetscInt)(sizeof(tau_critical_erosion_by_class) / sizeof(tau_critical_erosion_by_class[0]));
+  const PetscInt ntd   = (PetscInt)(sizeof(tau_critical_deposition_by_class) / sizeof(tau_critical_deposition_by_class[0]));
+
+  PetscCheck(nfrac == nkp && nfrac == nws && nfrac == nte && nfrac == ntd, comm, PETSC_ERR_USER,
+             "Tracer class parameter tables have inconsistent lengths");
+  PetscCheck(num_tracers_comp == nfrac, comm, PETSC_ERR_USER,
+             "Tracer class tables expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT, nfrac,
+             num_tracers_comp);
+
+  PetscReal frac_sum = 0.0;
+  for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+    PetscCheck(frac_init_by_class[s] >= 0.0, comm, PETSC_ERR_USER, "frac_init_by_class[%" PetscInt_FMT "] must be >= 0", s);
+    frac_sum += frac_init_by_class[s];
+  }
+  PetscCheck(PetscAbsReal(frac_sum - 1.0) < 1e-12, comm, PETSC_ERR_USER, "frac_init_by_class must sum to 1.0 (got %g)",
+             (double)frac_sum);
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_tracers_comp, MPI_Comm comm, TracerBedModel *bed) {
+  PetscFunctionBeginUser;
+
+  PetscCall(CheckTracerClassTables(num_tracers_comp, comm));
+
+  PetscInt ncells = mesh->num_cells;
+
+  bed->active_layer_thickness = 0.01;
+  bed->num_bed_layers         = 4;
+
+  PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_porosity));
+  PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_init_thickness));
+  PetscCall(PetscCalloc1(num_tracers_comp, &bed->bed_rho_s));
+
+  bed->bed_init_thickness[0] = bed->active_layer_thickness;
+  for (PetscInt layer = 1; layer < bed->num_bed_layers; ++layer) {
+    bed->bed_init_thickness[layer] = 0.05;
+  }
+  for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
+    bed->bed_porosity[layer] = 0.4;
+  }
+  for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+    bed->bed_rho_s[s] = 2650.0;
+  }
+
+  PetscInt nbed = bed->num_bed_layers * ncells * num_tracers_comp;
+  PetscCall(PetscCalloc1(nbed, &bed->bed_mass));
+  for (PetscInt c = 0; c < ncells; ++c) {
+    for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
+      PetscReal hL  = bed->bed_init_thickness[layer];
+      PetscReal por = bed->bed_porosity[layer];
+      for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+        PetscReal rho = bed->bed_rho_s[s];
+        PetscReal mL  = rho * (1.0 - por) * hL * frac_init_by_class[s];
+        bed->bed_mass[BED_INDEX(layer, c, s, ncells, num_tracers_comp)] = mL;
+      }
+    }
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode UpdateTracerBedActiveLayer(RDyMesh *mesh, PetscInt num_tracers_comp, TracerBedModel *bed) {
+  PetscFunctionBeginUser;
+
+  PetscReal *h_layer = NULL;
+  PetscCall(PetscMalloc1(bed->num_bed_layers, &h_layer));
+
+  for (PetscInt c = 0; c < mesh->num_cells; ++c) {
+    for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
+      PetscReal M_tot    = 0.0;
+      PetscReal rho_bulk = 0.0;
+      for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+        PetscReal m = bed->bed_mass[BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp)];
+        if (m < 0.0) m = 0.0;
+        M_tot += m;
+      }
+      if (M_tot <= 0.0) {
+        h_layer[layer] = 0.0;
+        continue;
+      }
+      for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+        PetscReal m = bed->bed_mass[BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp)];
+        if (m < 0.0) m = 0.0;
+        rho_bulk += (m / M_tot) * bed->bed_rho_s[s];
+      }
+      h_layer[layer] = M_tot / (rho_bulk * (1.0 - bed->bed_porosity[layer]));
+    }
+
+    PetscReal dht = h_layer[0] - bed->active_layer_thickness;
+    if (dht > 0.0 && h_layer[0] > 0.0 && bed->num_bed_layers > 1) {
+      PetscReal frac = dht / h_layer[0];
+      for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+        PetscInt idx_active = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+        PetscInt idx_next   = BED_INDEX(1, c, s, mesh->num_cells, num_tracers_comp);
+        PetscReal dm        = frac * bed->bed_mass[idx_active];
+        if (dm > bed->bed_mass[idx_active]) dm = bed->bed_mass[idx_active];
+        bed->bed_mass[idx_active] -= dm;
+        bed->bed_mass[idx_next] += dm;
+      }
+    } else if (dht < 0.0) {
+      PetscReal need = -dht;
+      for (PetscInt layer = 1; layer < bed->num_bed_layers && need > 0.0; ++layer) {
+        PetscReal ratio_xkv = (1.0 - bed->bed_porosity[layer]) / (1.0 - bed->bed_porosity[0]);
+        PetscReal eff_h_L   = h_layer[layer] * ratio_xkv;
+        if (eff_h_L <= 0.0) continue;
+        if (need >= eff_h_L) {
+          for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+            PetscInt idx_active = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+            PetscInt idx_layer  = BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp);
+            PetscReal dm        = bed->bed_mass[idx_layer];
+            bed->bed_mass[idx_layer] -= dm;
+            bed->bed_mass[idx_active] += dm;
+          }
+          need -= eff_h_L;
+        } else {
+          PetscReal frac = need / eff_h_L;
+          for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+            PetscInt idx_active = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+            PetscInt idx_layer  = BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp);
+            PetscReal dm        = frac * bed->bed_mass[idx_layer];
+            if (dm > bed->bed_mass[idx_layer]) dm = bed->bed_mass[idx_layer];
+            bed->bed_mass[idx_layer] -= dm;
+            bed->bed_mass[idx_active] += dm;
+          }
+          need = 0.0;
+        }
+      }
+    }
+  }
+
+  PetscCall(PetscFree(h_layer));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode DestroyTracerBedModel(TracerBedModel *bed) {
+  PetscFunctionBegin;
+  PetscCall(PetscFree(bed->bed_init_thickness));
+  PetscCall(PetscFree(bed->bed_mass));
+  PetscCall(PetscFree(bed->bed_porosity));
+  PetscCall(PetscFree(bed->bed_rho_s));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /// @brief Allocates memory for prognostic (h/hu/hv/hci) and diagnostic (u/v/ci) variables stored at
 ///        cell centers for tracers dynamics
 /// @param [in]  num_states        number of states
@@ -102,9 +269,11 @@ static PetscErrorCode CreateTracerRiemannEdgeData(PetscInt num_edges, PetscInt n
 /// @param [in]  tiny_h  a height threshold for determining wet/dry cell
 /// @param [out] *data   a TracerRiemannStateData
 /// @return              0 on success, or a non-zero error code on failure
-static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal tiny_h, TracerRiemannStateData *data) {
+static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal tiny_h, const PetscReal h_anuga,
+                                                               TracerRiemannStateData *data) {
   PetscFunctionBeginUser;
 
+  PetscReal denom;
   PetscInt index;
   for (PetscInt n = 0; n < data->num_states; n++) {
     if (data->h[n] < tiny_h) {
@@ -115,8 +284,9 @@ static PetscErrorCode ComputeRiemannVelocitiesAndConcentration(const PetscReal t
         data->ci[index] = 0.0;
       }
     } else {
-      data->u[n] = data->hu[n] / data->h[n];
-      data->v[n] = data->hv[n] / data->h[n];
+      denom      = Square(data->h[n]) + Square(h_anuga);
+      data->u[n] = data->hu[n] * data->h[n] / denom;
+      data->v[n] = data->hv[n] * data->h[n] / denom;
       for (PetscInt s = 0; s < data->num_tracers_comp; s++) {
         index           = n * data->num_tracers_comp + s;
         data->ci[index] = data->hci[index] / data->h[n];
@@ -135,6 +305,7 @@ typedef struct {
   RDyNumericsRiemann     riemann;       // riemann solver type
   RDyMesh               *mesh;          // domain mesh
   PetscReal              tiny_h;        // minimum water height for wet conditions
+  PetscReal              h_anuga_regular;
   TracerRiemannStateData left_states;   // "left" riemann states on interior edges
   TracerRiemannStateData right_states;  // "right" riemann states on interior edges
   TracerRiemannEdgeData  edges;         // riemann fluxes on interior edges
@@ -206,9 +377,10 @@ static PetscErrorCode ApplyTracerInteriorFlux(void *context, PetscOperatorFields
   }
 
   // compute diagnostic quantities
-  const PetscReal tiny_h = interior_flux_op->tiny_h;
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+  const PetscReal tiny_h  = interior_flux_op->tiny_h;
+  const PetscReal h_anuga = interior_flux_op->h_anuga_regular;
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datal));
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datar));
 
   // call Riemann solver
   switch (interior_flux_op->riemann) {
@@ -302,6 +474,7 @@ PetscErrorCode CreatePetscTracerInteriorFluxOperator(RDyMesh *mesh, const RDyCon
       .mesh        = mesh,
       .diagnostics = diagnostics,
       .tiny_h      = config.physics.flow.tiny_h,
+      .h_anuga_regular = config.physics.flow.h_anuga_regular,
   };
 
   // allocate left/right/edge Riemann data structures
@@ -340,6 +513,7 @@ typedef struct {
   Vec                    boundary_fluxes;     // boundary flux values vector
   OperatorDiagnostics   *diagnostics;         // courant number, boundary fluxes
   PetscReal              tiny_h;              // minimum water height for wet conditions
+  PetscReal              h_anuga_regular;
   TracerRiemannStateData left_states;
   TracerRiemannStateData right_states;
   TracerRiemannEdgeData  edges;
@@ -445,8 +619,9 @@ static PetscErrorCode ApplyTracerBoundaryFlux(void *context, PetscOperatorFields
   }
 
   // compute diagnostic quantities from prognostic variables
-  const PetscReal tiny_h = boundary_flux_op->tiny_h;
-  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datal));
+  const PetscReal tiny_h  = boundary_flux_op->tiny_h;
+  const PetscReal h_anuga = boundary_flux_op->h_anuga_regular;
+  PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datal));
 
   // compute the "right" Riemann cell values using the boundary condition
   switch (boundary_condition.flow->type) {
@@ -460,7 +635,7 @@ static PetscErrorCode ApplyTracerBoundaryFlux(void *context, PetscOperatorFields
           datar->hci[e * num_tracers_comp + s] = boundary_values_ptr[n_dof * e + 3 + s];
         }
       }
-      PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, datar));
+      PetscCall(ComputeRiemannVelocitiesAndConcentration(tiny_h, h_anuga, datar));
       break;
     case CONDITION_REFLECTING:
       PetscCall(ApplyTracerReflectingBC(boundary_flux_op->mesh, boundary, datal, datar, data_edge));
@@ -479,6 +654,23 @@ static PetscErrorCode ApplyTracerBoundaryFlux(void *context, PetscOperatorFields
       break;
     default:
       PetscCheck(PETSC_FALSE, comm, PETSC_ERR_USER, "Unsupported Riemann solver");
+  }
+
+  const PetscReal eps_flux = 1e-14;
+  for (PetscInt e = 0; e < boundary.num_edges; ++e) {
+    const PetscReal Fh = (PetscReal)boundary_fluxes_ptr[n_dof * e + 0];
+    for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+      const PetscInt  ci_off = e * num_tracers_comp + s;
+      const PetscReal c_int  = (PetscReal)datal->ci[ci_off];
+      const PetscReal c_bc   = (PetscReal)datar->ci[ci_off];
+      PetscReal       Cup    = 0.0;
+      if (Fh > eps_flux) {
+        Cup = c_int;
+      } else if (Fh < -eps_flux) {
+        Cup = c_bc;
+      }
+      boundary_fluxes_ptr[n_dof * e + 3 + s] = Fh * Cup;
+    }
   }
 
   // accumulate the flux values in f_global
@@ -562,6 +754,7 @@ PetscErrorCode CreatePetscTracerBoundaryFluxOperator(RDyMesh *mesh, const RDyCon
       .boundary_fluxes    = boundary_fluxes,
       .diagnostics        = diagnostics,
       .tiny_h             = config.physics.flow.tiny_h,
+      .h_anuga_regular    = config.physics.flow.h_anuga_regular,
   };
 
   // allocate left/right/edge Riemann data structures
@@ -595,6 +788,7 @@ typedef struct {
   Vec       mannings;          // mannings coefficient vector
   PetscReal tiny_h;            // minimum water height for wet conditions
   PetscReal xq2018_threshold;  // threshold for the XQ2018's implicit time integration of source term
+  TracerBedModel bed;
 } TracerSourceOperator;
 
 /// @brief Set the contribution of the source-term using the semi-implicit time integeration method
@@ -618,14 +812,9 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   RDyCells             *cells            = &mesh->cells;
   PetscReal             tiny_h           = source_op->tiny_h;
   PetscInt              num_tracers_comp = source_op->num_tracers_comp;
-
-  // FIXME: Need to move these constants into a struct that is specific to the erosion/deposition
-  // parameterization
-  const PetscReal kp_constant             = 0.001;
-  const PetscReal settling_velocity       = 0.01;
-  const PetscReal tau_critical_erosion    = 0.1;
-  const PetscReal tau_critical_deposition = 1000.0;
+  TracerBedModel       *bed              = &source_op->bed;
   const PetscReal rhow                    = DENSITY_OF_WATER;
+  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
 
   // access Vec data
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
@@ -680,13 +869,65 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        for (PetscInt s = 0; s < num_tracers_comp; s++) {
-          PetscReal ci    = u_ptr[n_dof * c + 3 + s] / h;
-          PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
-          PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-          PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
+        PetscReal tau_b  = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        PetscReal Mtot_a = 0.0;
+        for (PetscInt ss = 0; ss < num_tracers_comp; ++ss) {
+          PetscInt  idx_a = BED_INDEX(0, c, ss, mesh->num_cells, num_tracers_comp);
+          PetscReal M_a   = bed->bed_mass[idx_a];
+          if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
+        }
 
-          f_ptr[n_dof * owned_cell_id + 3 + s] += (ei - di) + source_ptr[n_dof * owned_cell_id + 3 + s];
+        for (PetscInt s = 0; s < num_tracers_comp; s++) {
+          PetscReal hc      = u_ptr[n_dof * c + 3 + s];
+          PetscReal ci      = hc / h;
+          PetscReal kp_s    = kp_constant_by_class[s];
+          PetscReal ws_s    = settling_velocity_by_class[s];
+          PetscReal tau_e_s = tau_critical_erosion_by_class[s];
+          PetscReal tau_d_s = tau_critical_deposition_by_class[s];
+          PetscReal frac_s  = frac_init_by_class[s];
+
+          if (Mtot_a > 0.0) {
+            PetscInt  idx_a_s = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+            PetscReal M_a_s   = bed->bed_mass[idx_a_s];
+            if (PetscIsInfOrNanReal(M_a_s) || M_a_s < 0.0) M_a_s = 0.0;
+            frac_s = M_a_s / Mtot_a;
+          }
+
+          PetscReal ei = 0.0;
+          PetscReal di = 0.0;
+          if (h >= h_ero_min && tau_e_s > 0.0 && tau_b > tau_e_s) {
+            PetscReal e0 = kp_s * (tau_b - tau_e_s) / tau_e_s;
+            if (e0 < 0.0) e0 = 0.0;
+            ei = frac_s * e0;
+          }
+          if (tau_d_s > 0.0 && tau_b < tau_d_s) {
+            PetscReal dep_factor = 1.0 - tau_b / tau_d_s;
+            di = ws_s * ci * dep_factor;
+            if (di < 0.0) di = 0.0;
+          }
+
+          PetscReal net_flux = ei - di;
+          if (dt > 0.0) {
+            PetscReal min_net_flux = -hc / dt;
+            if (net_flux < min_net_flux) net_flux = min_net_flux;
+          }
+
+          PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+          PetscReal M_a   = bed->bed_mass[idx_a];
+          if (PetscIsInfOrNanReal(M_a) || M_a < 0.0) M_a = 0.0;
+
+          PetscReal dM_bed_raw = -net_flux * dt;
+          if (dM_bed_raw < 0.0) {
+            PetscReal max_erosion = -M_a;
+            if (dM_bed_raw < max_erosion && dM_bed_raw != 0.0) {
+              PetscReal scale = max_erosion / dM_bed_raw;
+              net_flux *= scale;
+              dM_bed_raw = max_erosion;
+            }
+          }
+
+          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          bed->bed_mass[idx_a] += dM_bed_raw;
         }
       }
 
@@ -702,6 +943,9 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   PetscCall(VecRestoreArray(f_global, &f_ptr));
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
+  PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
+
+  PetscCall(UpdateTracerBedActiveLayer(mesh, num_tracers_comp, bed));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -712,6 +956,7 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
 static PetscErrorCode DestroyTracerSource(void *context) {
   PetscFunctionBegin;
   TracerSourceOperator *source_op = context;
+  PetscCall(DestroyTracerBedModel(&source_op->bed));
   PetscFree(source_op);
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -743,6 +988,7 @@ PetscErrorCode CreatePetscTracerSourceOperator(RDyMesh *mesh, const RDyConfig co
 
   MPI_Comm comm;
   PetscCall(PetscObjectGetComm((PetscObject)external_sources, &comm));
+  PetscCall(InitializeTracerBedModel(mesh, num_tracers_comp, comm, &source_op->bed));
 
   switch (config.physics.flow.source.method) {
     case SOURCE_SEMI_IMPLICIT:
@@ -1028,6 +1274,7 @@ typedef struct {
   Vec       mannings;          // mannings coefficient vector
   PetscReal tiny_h;            // minimum water height for wet conditions
   PetscReal xq2018_threshold;  // threshold for XQ2018
+  TracerBedModel bed;
 } TracerSourceHROperator;
 
 static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperatorFields fields, PetscReal dt, Vec u_local, Vec f_global) {
@@ -1043,12 +1290,9 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   RDyCells               *cells            = &mesh->cells;
   PetscReal               tiny_h           = source_op->tiny_h;
   PetscInt                num_tracers_comp = source_op->num_tracers_comp;
-
-  const PetscReal kp_constant             = 0.001;
-  const PetscReal settling_velocity       = 0.01;
-  const PetscReal tau_critical_erosion    = 0.1;
-  const PetscReal tau_critical_deposition = 1000.0;
+  TracerBedModel         *bed              = &source_op->bed;
   const PetscReal rhow                    = DENSITY_OF_WATER;
+  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
 
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));
@@ -1095,13 +1339,65 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        for (PetscInt s = 0; s < num_tracers_comp; s++) {
-          PetscReal ci    = u_ptr[n_dof * c + 3 + s] / h;
-          PetscReal tau_b = 0.5 * rhow * Cd * (Square(u) + Square(v));
-          PetscReal ei    = kp_constant * (tau_b - tau_critical_erosion) / tau_critical_erosion;
-          PetscReal di    = settling_velocity * ci * (1.0 - tau_b / tau_critical_deposition);
+        PetscReal tau_b  = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        PetscReal Mtot_a = 0.0;
+        for (PetscInt ss = 0; ss < num_tracers_comp; ++ss) {
+          PetscInt  idx_a = BED_INDEX(0, c, ss, mesh->num_cells, num_tracers_comp);
+          PetscReal M_a   = bed->bed_mass[idx_a];
+          if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
+        }
 
-          f_ptr[n_dof * owned_cell_id + 3 + s] += (ei - di) + source_ptr[n_dof * owned_cell_id + 3 + s];
+        for (PetscInt s = 0; s < num_tracers_comp; s++) {
+          PetscReal hc      = u_ptr[n_dof * c + 3 + s];
+          PetscReal ci      = hc / h;
+          PetscReal kp_s    = kp_constant_by_class[s];
+          PetscReal ws_s    = settling_velocity_by_class[s];
+          PetscReal tau_e_s = tau_critical_erosion_by_class[s];
+          PetscReal tau_d_s = tau_critical_deposition_by_class[s];
+          PetscReal frac_s  = frac_init_by_class[s];
+
+          if (Mtot_a > 0.0) {
+            PetscInt  idx_a_s = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+            PetscReal M_a_s   = bed->bed_mass[idx_a_s];
+            if (PetscIsInfOrNanReal(M_a_s) || M_a_s < 0.0) M_a_s = 0.0;
+            frac_s = M_a_s / Mtot_a;
+          }
+
+          PetscReal ei = 0.0;
+          PetscReal di = 0.0;
+          if (h >= h_ero_min && tau_e_s > 0.0 && tau_b > tau_e_s) {
+            PetscReal e0 = kp_s * (tau_b - tau_e_s) / tau_e_s;
+            if (e0 < 0.0) e0 = 0.0;
+            ei = frac_s * e0;
+          }
+          if (tau_d_s > 0.0 && tau_b < tau_d_s) {
+            PetscReal dep_factor = 1.0 - tau_b / tau_d_s;
+            di = ws_s * ci * dep_factor;
+            if (di < 0.0) di = 0.0;
+          }
+
+          PetscReal net_flux = ei - di;
+          if (dt > 0.0) {
+            PetscReal min_net_flux = -hc / dt;
+            if (net_flux < min_net_flux) net_flux = min_net_flux;
+          }
+
+          PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+          PetscReal M_a   = bed->bed_mass[idx_a];
+          if (PetscIsInfOrNanReal(M_a) || M_a < 0.0) M_a = 0.0;
+
+          PetscReal dM_bed_raw = -net_flux * dt;
+          if (dM_bed_raw < 0.0) {
+            PetscReal max_erosion = -M_a;
+            if (dM_bed_raw < max_erosion && dM_bed_raw != 0.0) {
+              PetscReal scale = max_erosion / dM_bed_raw;
+              net_flux *= scale;
+              dM_bed_raw = max_erosion;
+            }
+          }
+
+          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          bed->bed_mass[idx_a] += dM_bed_raw;
         }
       }
 
@@ -1115,6 +1411,9 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscCall(VecRestoreArray(f_global, &f_ptr));
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
+  PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
+
+  PetscCall(UpdateTracerBedActiveLayer(mesh, num_tracers_comp, bed));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -1122,6 +1421,7 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
 static PetscErrorCode DestroyTracerSourceHR(void *context) {
   PetscFunctionBegin;
   TracerSourceHROperator *source_op = context;
+  PetscCall(DestroyTracerBedModel(&source_op->bed));
   PetscFree(source_op);
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -1148,6 +1448,7 @@ PetscErrorCode CreatePetscTracerSourceHROperator(RDyMesh *mesh, const RDyConfig 
 
   MPI_Comm comm;
   PetscCall(PetscObjectGetComm((PetscObject)external_sources, &comm));
+  PetscCall(InitializeTracerBedModel(mesh, num_tracers_comp, comm, &source_op->bed));
 
   switch (config.physics.flow.source.method) {
     case SOURCE_SEMI_IMPLICIT:
