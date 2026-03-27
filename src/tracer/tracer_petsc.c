@@ -7,12 +7,14 @@
 
 #include "tracer_roe_flux_petsc.h"
 
-static const PetscReal frac_init_by_class[] = {0.05, 0.15, 0.80};
+static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
 static const PetscReal kp_constant_by_class[] = {4.e-06, 1.6e-05, 4.e-05};
 static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
-static const PetscReal tau_critical_erosion_by_class[] = {1.5, 1.5, 2.0};
+static const PetscReal tau_critical_erosion_by_class[] = {0.25, 0.2, 2.0};
 static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
-static const PetscReal sediment_density_by_class[] = {2650.0, 2650.0, 2650.0};
+static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
+// Initial stratification layer concentrations. The active layer reuses the first value.
+static const PetscReal layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
 
 typedef struct {
   PetscInt  num_bed_layers;
@@ -61,8 +63,16 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
 
   PetscInt ncells = mesh->num_cells;
 
-  bed->active_layer_thickness = 0.01;
+  bed->active_layer_thickness = 0.05;
   bed->num_bed_layers         = 4;
+
+  const PetscInt nconc = (PetscInt)(sizeof(layer_concentration_by_layer) / sizeof(layer_concentration_by_layer[0]));
+  PetscCheck(nconc == num_tracers_comp, comm, PETSC_ERR_USER,
+             "layer_concentration_by_layer expects %" PetscInt_FMT " entries, but num_tracers_comp=%" PetscInt_FMT, nconc,
+             num_tracers_comp);
+  PetscCheck(bed->num_bed_layers == nconc + 1, comm, PETSC_ERR_USER,
+             "Expected num_bed_layers = 1 + len(layer_concentration_by_layer), but got %" PetscInt_FMT " and %" PetscInt_FMT,
+             bed->num_bed_layers, nconc);
 
   PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_porosity));
   PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_init_thickness));
@@ -70,24 +80,38 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
 
   bed->bed_init_thickness[0] = bed->active_layer_thickness;
   for (PetscInt layer = 1; layer < bed->num_bed_layers; ++layer) {
-    bed->bed_init_thickness[layer] = 0.05;
-  }
-  for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
-    bed->bed_porosity[layer] = 0.4;
+    bed->bed_init_thickness[layer] = 0.1;
   }
   for (PetscInt s = 0; s < num_tracers_comp; ++s) {
     bed->bed_rho_s[s] = sediment_density_by_class[s];
+  }
+
+  PetscReal rho_bulk = 0.0;
+  for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+    rho_bulk += frac_init_by_class[s] * bed->bed_rho_s[s];
+  }
+  PetscCheck(rho_bulk > 0.0, comm, PETSC_ERR_USER, "Bulk sediment density must be positive");
+
+  for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
+    PetscInt   conc_idx     = (layer == 0) ? 0 : (layer - 1);
+    PetscReal concentration = layer_concentration_by_layer[conc_idx];
+    PetscCheck(concentration > 0.0, comm, PETSC_ERR_USER,
+               "layer_concentration_by_layer[%" PetscInt_FMT "] must be > 0", layer);
+    PetscCheck(concentration <= rho_bulk, comm, PETSC_ERR_USER,
+               "layer_concentration_by_layer[%" PetscInt_FMT "]=%g exceeds bulk grain density %g", layer, (double)concentration,
+               (double)rho_bulk);
+    bed->bed_porosity[layer] = 1.0 - concentration / rho_bulk;
   }
 
   PetscInt nbed = bed->num_bed_layers * ncells * num_tracers_comp;
   PetscCall(PetscCalloc1(nbed, &bed->bed_mass));
   for (PetscInt c = 0; c < ncells; ++c) {
     for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
-      PetscReal hL  = bed->bed_init_thickness[layer];
-      PetscReal por = bed->bed_porosity[layer];
+      PetscInt   conc_idx    = (layer == 0) ? 0 : (layer - 1);
+      PetscReal hL           = bed->bed_init_thickness[layer];
+      PetscReal layer_mass   = layer_concentration_by_layer[conc_idx] * hL;
       for (PetscInt s = 0; s < num_tracers_comp; ++s) {
-        PetscReal rho = bed->bed_rho_s[s];
-        PetscReal mL  = rho * (1.0 - por) * hL * frac_init_by_class[s];
+        PetscReal mL  = layer_mass * frac_init_by_class[s];
         bed->bed_mass[BED_INDEX(layer, c, s, ncells, num_tracers_comp)] = mL;
       }
     }
