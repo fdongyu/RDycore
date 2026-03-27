@@ -7,11 +7,12 @@
 
 #include "tracer_roe_flux_petsc.h"
 
-static const PetscReal frac_init_by_class[] = {0.05, 0.15, 0.80};
+static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
 static const PetscReal kp_constant_by_class[] = {4.e-06, 1.6e-05, 4.e-05};
 static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
 static const PetscReal tau_critical_erosion_by_class[] = {0.25, 0.2, 2.0};
 static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
+static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
 
 typedef struct {
   PetscInt  num_bed_layers;
@@ -32,8 +33,9 @@ static PetscErrorCode CheckTracerClassTables(PetscInt num_tracers_comp, MPI_Comm
   const PetscInt nws   = (PetscInt)(sizeof(settling_velocity_by_class) / sizeof(settling_velocity_by_class[0]));
   const PetscInt nte   = (PetscInt)(sizeof(tau_critical_erosion_by_class) / sizeof(tau_critical_erosion_by_class[0]));
   const PetscInt ntd   = (PetscInt)(sizeof(tau_critical_deposition_by_class) / sizeof(tau_critical_deposition_by_class[0]));
+  const PetscInt nrho  = (PetscInt)(sizeof(sediment_density_by_class) / sizeof(sediment_density_by_class[0]));
 
-  PetscCheck(nfrac == nkp && nfrac == nws && nfrac == nte && nfrac == ntd, comm, PETSC_ERR_USER,
+  PetscCheck(nfrac == nkp && nfrac == nws && nfrac == nte && nfrac == ntd && nfrac == nrho, comm, PETSC_ERR_USER,
              "Tracer class parameter tables have inconsistent lengths");
   PetscCheck(num_tracers_comp == nfrac, comm, PETSC_ERR_USER,
              "Tracer class tables expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT, nfrac,
@@ -42,6 +44,8 @@ static PetscErrorCode CheckTracerClassTables(PetscInt num_tracers_comp, MPI_Comm
   PetscReal frac_sum = 0.0;
   for (PetscInt s = 0; s < num_tracers_comp; ++s) {
     PetscCheck(frac_init_by_class[s] >= 0.0, comm, PETSC_ERR_USER, "frac_init_by_class[%" PetscInt_FMT "] must be >= 0", s);
+    PetscCheck(sediment_density_by_class[s] > 0.0, comm, PETSC_ERR_USER,
+               "sediment_density_by_class[%" PetscInt_FMT "] must be > 0", s);
     frac_sum += frac_init_by_class[s];
   }
   PetscCheck(PetscAbsReal(frac_sum - 1.0) < 1e-12, comm, PETSC_ERR_USER, "frac_init_by_class must sum to 1.0 (got %g)",
@@ -72,7 +76,7 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
     bed->bed_porosity[layer] = 0.4;
   }
   for (PetscInt s = 0; s < num_tracers_comp; ++s) {
-    bed->bed_rho_s[s] = 2650.0;
+    bed->bed_rho_s[s] = sediment_density_by_class[s];
   }
 
   PetscInt nbed = bed->num_bed_layers * ncells * num_tracers_comp;
