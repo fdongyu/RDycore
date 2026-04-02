@@ -8,18 +8,19 @@
 #include "tracer_roe_flux_petsc.h"
 
 static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
-static const PetscReal kp_constant_by_class[] = {4.e-06, 1.6e-05, 4.e-05};
 static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
-static const PetscReal tau_critical_erosion_by_class[] = {0.25, 0.2, 2.0};
 static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
 static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
 static const PetscReal layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
+static const PetscReal partheniades_constant_by_layer[] = {4.e-06, 1.6e-05, 4.e-05};
+static const PetscReal tau_critical_erosion_by_layer[] = {0.25, 0.2, 2.0};
 
 typedef struct {
   PetscInt  num_bed_layers;
   PetscReal active_layer_thickness;
   PetscReal *bed_init_thickness;
   PetscReal *bed_mass;
+  PetscReal *active_layer_concentration;
   PetscReal *bed_porosity;
   PetscReal *bed_rho_s;
 } TracerBedModel;
@@ -30,16 +31,20 @@ static PetscErrorCode CheckTracerClassTables(PetscInt num_tracers_comp, MPI_Comm
   PetscFunctionBeginUser;
 
   const PetscInt nfrac = (PetscInt)(sizeof(frac_init_by_class) / sizeof(frac_init_by_class[0]));
-  const PetscInt nkp   = (PetscInt)(sizeof(kp_constant_by_class) / sizeof(kp_constant_by_class[0]));
   const PetscInt nws   = (PetscInt)(sizeof(settling_velocity_by_class) / sizeof(settling_velocity_by_class[0]));
-  const PetscInt nte   = (PetscInt)(sizeof(tau_critical_erosion_by_class) / sizeof(tau_critical_erosion_by_class[0]));
   const PetscInt ntd   = (PetscInt)(sizeof(tau_critical_deposition_by_class) / sizeof(tau_critical_deposition_by_class[0]));
   const PetscInt nrho  = (PetscInt)(sizeof(sediment_density_by_class) / sizeof(sediment_density_by_class[0]));
+  const PetscInt nconc = (PetscInt)(sizeof(layer_concentration_by_layer) / sizeof(layer_concentration_by_layer[0]));
+  const PetscInt nkp   = (PetscInt)(sizeof(partheniades_constant_by_layer) / sizeof(partheniades_constant_by_layer[0]));
+  const PetscInt nte   = (PetscInt)(sizeof(tau_critical_erosion_by_layer) / sizeof(tau_critical_erosion_by_layer[0]));
 
-  PetscCheck(nfrac == nkp && nfrac == nws && nfrac == nte && nfrac == ntd && nfrac == nrho, comm, PETSC_ERR_USER,
-             "Tracer class parameter tables have inconsistent lengths");
+  PetscCheck(nfrac == nws && nfrac == ntd && nfrac == nrho, comm, PETSC_ERR_USER, "Tracer class parameter tables have inconsistent lengths");
   PetscCheck(num_tracers_comp == nfrac, comm, PETSC_ERR_USER,
              "Tracer class tables expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT, nfrac,
+             num_tracers_comp);
+  PetscCheck(nconc == nkp && nconc == nte, comm, PETSC_ERR_USER, "Tracer layer erosion tables have inconsistent lengths");
+  PetscCheck(num_tracers_comp == nconc, comm, PETSC_ERR_USER,
+             "Tracer layer tables expect %" PetscInt_FMT " entries, but config.physics.sediment.num_classes=%" PetscInt_FMT, nconc,
              num_tracers_comp);
 
   PetscReal frac_sum = 0.0;
@@ -53,6 +58,119 @@ static PetscErrorCode CheckTracerClassTables(PetscInt num_tracers_comp, MPI_Comm
              (double)frac_sum);
 
   PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static inline PetscInt TracerLayerPropertyIndex(PetscInt layer) { return (layer == 0) ? 0 : (layer - 1); }
+
+static inline PetscReal TracerLayerConcentration(PetscInt layer) { return layer_concentration_by_layer[TracerLayerPropertyIndex(layer)]; }
+
+static PetscReal ClampTracerActiveLayerConcentration(PetscReal active_conc) {
+  const PetscInt nconc = (PetscInt)(sizeof(layer_concentration_by_layer) / sizeof(layer_concentration_by_layer[0]));
+  if (active_conc < layer_concentration_by_layer[0]) active_conc = layer_concentration_by_layer[0];
+  if (active_conc > layer_concentration_by_layer[nconc - 1]) active_conc = layer_concentration_by_layer[nconc - 1];
+  return active_conc;
+}
+
+static PetscReal ComputeTracerLayerTotalMass(const TracerBedModel *bed, PetscInt cell, PetscInt layer, PetscInt num_cells,
+                                             PetscInt num_tracers_comp) {
+  PetscReal M_tot = 0.0;
+  for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+    PetscReal m = bed->bed_mass[BED_INDEX(layer, cell, s, num_cells, num_tracers_comp)];
+    if (!PetscIsInfOrNanReal(m) && m > 0.0) M_tot += m;
+  }
+  return M_tot;
+}
+
+static PetscReal ComputeTracerActiveLayerConcentration(const TracerBedModel *bed, PetscInt cell, PetscInt num_cells,
+                                                       PetscInt num_tracers_comp) {
+  (void)num_cells;
+  (void)num_tracers_comp;
+  return ClampTracerActiveLayerConcentration(bed->active_layer_concentration[cell]);
+}
+
+static void InterpolateTracerActiveLayerErosionProperties(PetscReal active_conc, PetscReal *tau_e_active, PetscReal *kp_active) {
+  const PetscInt nconc = (PetscInt)(sizeof(layer_concentration_by_layer) / sizeof(layer_concentration_by_layer[0]));
+
+  if (active_conc <= layer_concentration_by_layer[0]) {
+    *tau_e_active = tau_critical_erosion_by_layer[0];
+    *kp_active    = partheniades_constant_by_layer[0];
+    return;
+  }
+  if (active_conc >= layer_concentration_by_layer[nconc - 1]) {
+    *tau_e_active = tau_critical_erosion_by_layer[nconc - 1];
+    *kp_active    = partheniades_constant_by_layer[nconc - 1];
+    return;
+  }
+
+  for (PetscInt k = 1; k < nconc; ++k) {
+    PetscReal c0 = layer_concentration_by_layer[k - 1];
+    PetscReal c1 = layer_concentration_by_layer[k];
+    if (active_conc <= c1) {
+      PetscReal alpha = (active_conc - c0) / (c1 - c0);
+      *tau_e_active   = tau_critical_erosion_by_layer[k - 1] +
+                      alpha * (tau_critical_erosion_by_layer[k] - tau_critical_erosion_by_layer[k - 1]);
+      *kp_active = partheniades_constant_by_layer[k - 1] +
+                   alpha * (partheniades_constant_by_layer[k] - partheniades_constant_by_layer[k - 1]);
+      return;
+    }
+  }
+
+  *tau_e_active = tau_critical_erosion_by_layer[nconc - 1];
+  *kp_active    = partheniades_constant_by_layer[nconc - 1];
+}
+
+static void GetTracerLayerErosionProperties(PetscInt layer, PetscReal active_conc, PetscReal *tau_e_layer, PetscReal *kp_layer) {
+  if (layer == 0) {
+    InterpolateTracerActiveLayerErosionProperties(active_conc, tau_e_layer, kp_layer);
+  } else {
+    PetscInt idx = TracerLayerPropertyIndex(layer);
+    *tau_e_layer = tau_critical_erosion_by_layer[idx];
+    *kp_layer    = partheniades_constant_by_layer[idx];
+  }
+}
+
+static void ComputeTracerErodedMassByClass(TracerBedModel *bed, PetscInt cell, PetscInt num_cells, PetscInt num_tracers_comp, PetscReal h,
+                                           PetscReal h_ero_min, PetscReal tau_b, PetscReal dt, PetscReal *eroded_mass_by_class) {
+  for (PetscInt s = 0; s < num_tracers_comp; ++s) eroded_mass_by_class[s] = 0.0;
+
+  if (h < h_ero_min || dt <= 0.0) return;
+
+  PetscReal remaining_dt = dt;
+  PetscReal active_conc  = ComputeTracerActiveLayerConcentration(bed, cell, num_cells, num_tracers_comp);
+
+  for (PetscInt layer = 0; layer < bed->num_bed_layers && remaining_dt > 0.0; ++layer) {
+    PetscReal Mtot_layer = ComputeTracerLayerTotalMass(bed, cell, layer, num_cells, num_tracers_comp);
+    if (Mtot_layer <= 0.0) continue;
+
+    PetscReal tau_e_layer = 0.0;
+    PetscReal kp_layer    = 0.0;
+    GetTracerLayerErosionProperties(layer, active_conc, &tau_e_layer, &kp_layer);
+
+    if (tau_e_layer <= 0.0 || tau_b <= tau_e_layer) break;
+
+    PetscReal erosion_flux = kp_layer * (tau_b - tau_e_layer) / tau_e_layer;
+    if (erosion_flux <= 0.0) break;
+
+    PetscReal erodible_mass = PetscMin(Mtot_layer, erosion_flux * remaining_dt);
+    if (erodible_mass <= 0.0) break;
+
+    for (PetscInt s = 0; s < num_tracers_comp; ++s) {
+      PetscInt  idx_layer = BED_INDEX(layer, cell, s, num_cells, num_tracers_comp);
+      PetscReal M_layer_s = bed->bed_mass[idx_layer];
+      if (PetscIsInfOrNanReal(M_layer_s) || M_layer_s < 0.0) M_layer_s = 0.0;
+
+      PetscReal frac_s = M_layer_s / Mtot_layer;
+      PetscReal dm_s   = erodible_mass * frac_s;
+      if (dm_s > bed->bed_mass[idx_layer]) dm_s = bed->bed_mass[idx_layer];
+
+      bed->bed_mass[idx_layer] -= dm_s;
+      eroded_mass_by_class[s] += dm_s;
+    }
+
+    PetscReal time_used = erodible_mass / erosion_flux;
+    remaining_dt -= time_used;
+    if (erodible_mass < Mtot_layer) break;
+  }
 }
 
 static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_tracers_comp, MPI_Comm comm, TracerBedModel *bed) {
@@ -76,6 +194,7 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
   PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_porosity));
   PetscCall(PetscCalloc1(bed->num_bed_layers, &bed->bed_init_thickness));
   PetscCall(PetscCalloc1(num_tracers_comp, &bed->bed_rho_s));
+  PetscCall(PetscCalloc1(ncells, &bed->active_layer_concentration));
 
   bed->bed_init_thickness[0] = bed->active_layer_thickness;
   for (PetscInt layer = 1; layer < bed->num_bed_layers; ++layer) {
@@ -92,8 +211,7 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
   PetscCheck(rho_bulk > 0.0, comm, PETSC_ERR_USER, "Bulk sediment density must be positive");
 
   for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
-    PetscInt   conc_idx     = (layer == 0) ? 0 : (layer - 1);
-    PetscReal concentration = layer_concentration_by_layer[conc_idx];
+    PetscReal concentration = TracerLayerConcentration(layer);
     PetscCheck(concentration > 0.0, comm, PETSC_ERR_USER,
                "layer_concentration_by_layer[%" PetscInt_FMT "] must be > 0", layer);
     PetscCheck(concentration <= rho_bulk, comm, PETSC_ERR_USER,
@@ -105,10 +223,10 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
   PetscInt nbed = bed->num_bed_layers * ncells * num_tracers_comp;
   PetscCall(PetscCalloc1(nbed, &bed->bed_mass));
   for (PetscInt c = 0; c < ncells; ++c) {
+    bed->active_layer_concentration[c] = layer_concentration_by_layer[0];
     for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
-      PetscInt   conc_idx    = (layer == 0) ? 0 : (layer - 1);
       PetscReal hL           = bed->bed_init_thickness[layer];
-      PetscReal layer_mass   = layer_concentration_by_layer[conc_idx] * hL;
+      PetscReal layer_mass   = TracerLayerConcentration(layer) * hL;
       for (PetscInt s = 0; s < num_tracers_comp; ++s) {
         PetscReal mL  = layer_mass * frac_init_by_class[s];
         bed->bed_mass[BED_INDEX(layer, c, s, ncells, num_tracers_comp)] = mL;
@@ -126,6 +244,10 @@ static PetscErrorCode UpdateTracerBedActiveLayer(RDyMesh *mesh, PetscInt num_tra
   PetscCall(PetscMalloc1(bed->num_bed_layers, &h_layer));
 
   for (PetscInt c = 0; c < mesh->num_cells; ++c) {
+    PetscReal active_conc = ComputeTracerActiveLayerConcentration(bed, c, mesh->num_cells, num_tracers_comp);
+    PetscReal active_mass = ComputeTracerLayerTotalMass(bed, c, 0, mesh->num_cells, num_tracers_comp);
+    if (bed->num_bed_layers > 1) active_conc = PetscMax(active_conc, TracerLayerConcentration(1));
+
     for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
       PetscReal M_tot    = 0.0;
       PetscReal rho_bulk = 0.0;
@@ -163,17 +285,29 @@ static PetscErrorCode UpdateTracerBedActiveLayer(RDyMesh *mesh, PetscInt num_tra
         PetscReal ratio_xkv = (1.0 - bed->bed_porosity[layer]) / (1.0 - bed->bed_porosity[0]);
         PetscReal eff_h_L   = h_layer[layer] * ratio_xkv;
         if (eff_h_L <= 0.0) continue;
+        PetscReal donor_conc = TracerLayerConcentration(layer);
         if (need >= eff_h_L) {
+          PetscReal dm_tot = 0.0;
           for (PetscInt s = 0; s < num_tracers_comp; ++s) {
             PetscInt idx_active = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
             PetscInt idx_layer  = BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp);
             PetscReal dm        = bed->bed_mass[idx_layer];
             bed->bed_mass[idx_layer] -= dm;
             bed->bed_mass[idx_active] += dm;
+            dm_tot += dm;
+          }
+          if (dm_tot > 0.0) {
+            if (active_mass + dm_tot > 0.0) {
+              active_conc = (active_conc * active_mass + donor_conc * dm_tot) / (active_mass + dm_tot);
+            } else {
+              active_conc = donor_conc;
+            }
+            active_mass += dm_tot;
           }
           need -= eff_h_L;
         } else {
           PetscReal frac = need / eff_h_L;
+          PetscReal dm_tot = 0.0;
           for (PetscInt s = 0; s < num_tracers_comp; ++s) {
             PetscInt idx_active = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
             PetscInt idx_layer  = BED_INDEX(layer, c, s, mesh->num_cells, num_tracers_comp);
@@ -181,11 +315,22 @@ static PetscErrorCode UpdateTracerBedActiveLayer(RDyMesh *mesh, PetscInt num_tra
             if (dm > bed->bed_mass[idx_layer]) dm = bed->bed_mass[idx_layer];
             bed->bed_mass[idx_layer] -= dm;
             bed->bed_mass[idx_active] += dm;
+            dm_tot += dm;
+          }
+          if (dm_tot > 0.0) {
+            if (active_mass + dm_tot > 0.0) {
+              active_conc = (active_conc * active_mass + donor_conc * dm_tot) / (active_mass + dm_tot);
+            } else {
+              active_conc = donor_conc;
+            }
+            active_mass += dm_tot;
           }
           need = 0.0;
         }
       }
     }
+
+    bed->active_layer_concentration[c] = ClampTracerActiveLayerConcentration(active_conc);
   }
 
   PetscCall(PetscFree(h_layer));
@@ -196,6 +341,7 @@ static PetscErrorCode DestroyTracerBedModel(TracerBedModel *bed) {
   PetscFunctionBegin;
   PetscCall(PetscFree(bed->bed_init_thickness));
   PetscCall(PetscFree(bed->bed_mass));
+  PetscCall(PetscFree(bed->active_layer_concentration));
   PetscCall(PetscFree(bed->bed_porosity));
   PetscCall(PetscFree(bed->bed_rho_s));
   PetscFunctionReturn(PETSC_SUCCESS);
@@ -859,6 +1005,8 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
 
   PetscInt n_dof;
   PetscCall(VecGetBlockSize(u_local, &n_dof));
+  PetscReal *eroded_mass_by_class = NULL;
+  PetscCall(PetscCalloc1(num_tracers_comp, &eroded_mass_by_class));
 
   for (PetscInt c = 0; c < mesh->num_cells; ++c) {
     if (cells->is_owned[c]) {
@@ -896,37 +1044,22 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        PetscReal tau_b  = 0.5 * rhow * Cd * (Square(u) + Square(v));
-        PetscReal Mtot_a = 0.0;
-        for (PetscInt ss = 0; ss < num_tracers_comp; ++ss) {
-          PetscInt  idx_a = BED_INDEX(0, c, ss, mesh->num_cells, num_tracers_comp);
-          PetscReal M_a   = bed->bed_mass[idx_a];
-          if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
-        }
+        PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        ComputeTracerErodedMassByClass(bed, c, mesh->num_cells, num_tracers_comp, h, h_ero_min, tau_b, dt, eroded_mass_by_class);
+        PetscReal Mtot_a      = ComputeTracerLayerTotalMass(bed, c, 0, mesh->num_cells, num_tracers_comp);
+        PetscReal active_conc = ComputeTracerActiveLayerConcentration(bed, c, mesh->num_cells, num_tracers_comp);
+
+        PetscReal deposited_mass_total = 0.0;
 
         for (PetscInt s = 0; s < num_tracers_comp; s++) {
           PetscReal hc      = u_ptr[n_dof * c + 3 + s];
           PetscReal ci      = hc / h;
-          PetscReal kp_s    = kp_constant_by_class[s];
           PetscReal ws_s    = settling_velocity_by_class[s];
-          PetscReal tau_e_s = tau_critical_erosion_by_class[s];
           PetscReal tau_d_s = tau_critical_deposition_by_class[s];
-          PetscReal frac_s  = frac_init_by_class[s];
-
-          if (Mtot_a > 0.0) {
-            PetscInt  idx_a_s = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-            PetscReal M_a_s   = bed->bed_mass[idx_a_s];
-            if (PetscIsInfOrNanReal(M_a_s) || M_a_s < 0.0) M_a_s = 0.0;
-            frac_s = M_a_s / Mtot_a;
-          }
 
           PetscReal ei = 0.0;
           PetscReal di = 0.0;
-          if (h >= h_ero_min && tau_e_s > 0.0 && tau_b > tau_e_s) {
-            PetscReal e0 = kp_s * (tau_b - tau_e_s) / tau_e_s;
-            if (e0 < 0.0) e0 = 0.0;
-            ei = frac_s * e0;
-          }
+          if (dt > 0.0) ei = eroded_mass_by_class[s] / dt;
           if (tau_d_s > 0.0 && tau_b < tau_d_s) {
             PetscReal dep_factor = 1.0 - tau_b / tau_d_s;
             di = ws_s * ci * dep_factor;
@@ -940,21 +1073,21 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
           }
 
           PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-          PetscReal M_a   = bed->bed_mass[idx_a];
-          if (PetscIsInfOrNanReal(M_a) || M_a < 0.0) M_a = 0.0;
-
-          PetscReal dM_bed_raw = -net_flux * dt;
-          if (dM_bed_raw < 0.0) {
-            PetscReal max_erosion = -M_a;
-            if (dM_bed_raw < max_erosion && dM_bed_raw != 0.0) {
-              PetscReal scale = max_erosion / dM_bed_raw;
-              net_flux *= scale;
-              dM_bed_raw = max_erosion;
-            }
-          }
+          PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
 
           f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
-          bed->bed_mass[idx_a] += dM_bed_raw;
+          bed->bed_mass[idx_a] += deposited_mass;
+          deposited_mass_total += deposited_mass;
+        }
+
+        if (deposited_mass_total > 0.0 && bed->num_bed_layers > 1) {
+          PetscReal donor_conc = TracerLayerConcentration(1);
+          if (Mtot_a + deposited_mass_total > 0.0) {
+            active_conc = (active_conc * Mtot_a + donor_conc * deposited_mass_total) / (Mtot_a + deposited_mass_total);
+          } else {
+            active_conc = donor_conc;
+          }
+          bed->active_layer_concentration[c] = ClampTracerActiveLayerConcentration(active_conc);
         }
       }
 
@@ -971,6 +1104,7 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
   PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
+  PetscCall(PetscFree(eroded_mass_by_class));
 
   PetscCall(UpdateTracerBedActiveLayer(mesh, num_tracers_comp, bed));
 
@@ -1335,6 +1469,8 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
 
   PetscInt n_dof;
   PetscCall(VecGetBlockSize(u_local, &n_dof));
+  PetscReal *eroded_mass_by_class = NULL;
+  PetscCall(PetscCalloc1(num_tracers_comp, &eroded_mass_by_class));
 
   for (PetscInt c = 0; c < mesh->num_cells; ++c) {
     if (cells->is_owned[c]) {
@@ -1366,37 +1502,22 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        PetscReal tau_b  = 0.5 * rhow * Cd * (Square(u) + Square(v));
-        PetscReal Mtot_a = 0.0;
-        for (PetscInt ss = 0; ss < num_tracers_comp; ++ss) {
-          PetscInt  idx_a = BED_INDEX(0, c, ss, mesh->num_cells, num_tracers_comp);
-          PetscReal M_a   = bed->bed_mass[idx_a];
-          if (!PetscIsInfOrNanReal(M_a) && M_a > 0.0) Mtot_a += M_a;
-        }
+        PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        ComputeTracerErodedMassByClass(bed, c, mesh->num_cells, num_tracers_comp, h, h_ero_min, tau_b, dt, eroded_mass_by_class);
+        PetscReal Mtot_a      = ComputeTracerLayerTotalMass(bed, c, 0, mesh->num_cells, num_tracers_comp);
+        PetscReal active_conc = ComputeTracerActiveLayerConcentration(bed, c, mesh->num_cells, num_tracers_comp);
+
+        PetscReal deposited_mass_total = 0.0;
 
         for (PetscInt s = 0; s < num_tracers_comp; s++) {
           PetscReal hc      = u_ptr[n_dof * c + 3 + s];
           PetscReal ci      = hc / h;
-          PetscReal kp_s    = kp_constant_by_class[s];
           PetscReal ws_s    = settling_velocity_by_class[s];
-          PetscReal tau_e_s = tau_critical_erosion_by_class[s];
           PetscReal tau_d_s = tau_critical_deposition_by_class[s];
-          PetscReal frac_s  = frac_init_by_class[s];
-
-          if (Mtot_a > 0.0) {
-            PetscInt  idx_a_s = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-            PetscReal M_a_s   = bed->bed_mass[idx_a_s];
-            if (PetscIsInfOrNanReal(M_a_s) || M_a_s < 0.0) M_a_s = 0.0;
-            frac_s = M_a_s / Mtot_a;
-          }
 
           PetscReal ei = 0.0;
           PetscReal di = 0.0;
-          if (h >= h_ero_min && tau_e_s > 0.0 && tau_b > tau_e_s) {
-            PetscReal e0 = kp_s * (tau_b - tau_e_s) / tau_e_s;
-            if (e0 < 0.0) e0 = 0.0;
-            ei = frac_s * e0;
-          }
+          if (dt > 0.0) ei = eroded_mass_by_class[s] / dt;
           if (tau_d_s > 0.0 && tau_b < tau_d_s) {
             PetscReal dep_factor = 1.0 - tau_b / tau_d_s;
             di = ws_s * ci * dep_factor;
@@ -1410,21 +1531,21 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
           }
 
           PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-          PetscReal M_a   = bed->bed_mass[idx_a];
-          if (PetscIsInfOrNanReal(M_a) || M_a < 0.0) M_a = 0.0;
-
-          PetscReal dM_bed_raw = -net_flux * dt;
-          if (dM_bed_raw < 0.0) {
-            PetscReal max_erosion = -M_a;
-            if (dM_bed_raw < max_erosion && dM_bed_raw != 0.0) {
-              PetscReal scale = max_erosion / dM_bed_raw;
-              net_flux *= scale;
-              dM_bed_raw = max_erosion;
-            }
-          }
+          PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
 
           f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
-          bed->bed_mass[idx_a] += dM_bed_raw;
+          bed->bed_mass[idx_a] += deposited_mass;
+          deposited_mass_total += deposited_mass;
+        }
+
+        if (deposited_mass_total > 0.0 && bed->num_bed_layers > 1) {
+          PetscReal donor_conc = TracerLayerConcentration(1);
+          if (Mtot_a + deposited_mass_total > 0.0) {
+            active_conc = (active_conc * Mtot_a + donor_conc * deposited_mass_total) / (Mtot_a + deposited_mass_total);
+          } else {
+            active_conc = donor_conc;
+          }
+          bed->active_layer_concentration[c] = ClampTracerActiveLayerConcentration(active_conc);
         }
       }
 
@@ -1439,6 +1560,7 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
   PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
+  PetscCall(PetscFree(eroded_mass_by_class));
 
   PetscCall(UpdateTracerBedActiveLayer(mesh, num_tracers_comp, bed));
 
