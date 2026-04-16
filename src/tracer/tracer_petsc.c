@@ -1453,7 +1453,8 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscInt                num_tracers_comp = source_op->num_tracers_comp;
   TracerBedModel         *bed              = &source_op->bed;
   const PetscReal rhow                    = DENSITY_OF_WATER;
-  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
+  //const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
+  const PetscReal h_ero_min               = 0;
 
   PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));

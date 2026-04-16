@@ -15,6 +15,12 @@ PetscErrorCode RDyGetNumOwnedCells(RDy rdy, PetscInt *num_cells) {
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+PetscErrorCode RDyGetNumSedimentClasses(RDy rdy, PetscInt *num_classes) {
+  PetscFunctionBegin;
+  *num_classes = rdy->config.physics.sediment.num_classes;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 PetscErrorCode RDyGetNumBoundaryConditions(RDy rdy, PetscInt *num_bnd_conds) {
   PetscFunctionBegin;
   *num_bnd_conds = rdy->num_boundaries;
