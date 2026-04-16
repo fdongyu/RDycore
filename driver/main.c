@@ -113,6 +113,13 @@ typedef struct {
 } SourceSink;
 
 typedef struct {
+  PetscBool enabled;
+  PetscInt  region_id;
+  PetscInt  ndatasets;
+  SourceSink *datasets;
+} RasterSedimentSource;
+
+typedef struct {
   DatasetType             type;
   HomogeneousDataset      homogeneous;       // spatially-homogeneous, temporally-varying BC
   UnstructuredDataset     unstructured;      // spatio-temporally varying BC in unstructured grid format
@@ -1032,6 +1039,29 @@ PetscErrorCode SetRasterData(RasterDataset *data, PetscReal cur_time, PetscInt n
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/// @brief Set sediment source value for local cells from a spatially-raster dataset.
+/// @param data      [in]  A pointer to RasterDataset struct
+/// @param cur_time  [in]  Current time
+/// @param ncells    [in]  Number of local cells
+/// @param values    [out] Source values for local cells
+/// @return PETSC_SUCESS on success
+PetscErrorCode SetRasterSourceData(RasterDataset *data, PetscReal cur_time, PetscInt ncells, PetscReal *values) {
+  PetscFunctionBegin;
+
+  if (cur_time / 3600.0 >= (data->ndata_file) * data->dtime_in_hour) {
+    OpenNextRasterDataset(data);
+  }
+
+  PetscInt  offset                    = data->header_offset;
+  PetscReal kg_per_m2_per_hr_to_per_s = 1.0 / 3600.0;
+  for (PetscInt icell = 0; icell < ncells; icell++) {
+    PetscInt idx = data->data2mesh_idx[icell];
+    values[icell] = data->data_ptr[idx + offset] * kg_per_m2_per_hr_to_per_s;  // convert kg/m^2/hr -> kg/m^2/s
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /// @brief Sets rainfall value for local grid cells based on spatially homogenous, temporally-varying rainfall dataset
 /// @param homogeneous_rain [in]  A pointer to HomogeneousDataset
 /// @param cur_time         [in]  Current time
@@ -1525,6 +1555,152 @@ PetscErrorCode DestroyRainfallDataset(SourceSink *rain_dataset) {
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/// @brief Save information about spatially-raster sediment source dataset from command line options.
+/// @param sediment_source [inout] Pointer to a RasterSedimentSource struct
+/// @return PETSC_SUCESS on success
+PetscErrorCode ParseRasterSedimentDataOptions(RasterSedimentSource *sediment_source) {
+  PetscFunctionBegin;
+
+  sediment_source->enabled   = PETSC_FALSE;
+  sediment_source->region_id = 1;
+  PetscCall(PetscOptionsGetInt(NULL, NULL, "-raster_sediment_region_id", &sediment_source->region_id, NULL));
+  sediment_source->ndatasets = 0;
+  sediment_source->datasets  = NULL;
+
+#define NUM_RASTER_SEDIMENT_DATE_VALUES 5
+#define MAX_RASTER_SEDIMENT_DATASETS 20
+  PetscBool raster_start_date_flag;
+  {
+    char     *dirs[MAX_RASTER_SEDIMENT_DATASETS];
+    PetscInt  ndirs = MAX_RASTER_SEDIMENT_DATASETS;
+    PetscBool dirs_flag;
+    PetscCall(PetscOptionsGetStringArray(NULL, NULL, "-raster_sediment_dirs", dirs, &ndirs, &dirs_flag));
+
+    PetscBool write_map_for_debugging = PETSC_FALSE;
+    PetscBool write_map               = PETSC_FALSE;
+    PetscBool read_map                = PETSC_FALSE;
+    char      map_file[PETSC_MAX_PATH_LEN];
+    PetscOptionsGetBool(NULL, NULL, "-raster_sediment_write_map_for_debugging", &write_map_for_debugging, NULL);
+    PetscOptionsGetString(NULL, NULL, "-raster_sediment_write_map_file", map_file, sizeof(map_file), &write_map);
+    PetscOptionsGetString(NULL, NULL, "-raster_sediment_read_map_file", map_file, sizeof(map_file), &read_map);
+
+    PetscInt date[NUM_RASTER_SEDIMENT_DATE_VALUES];
+    PetscInt ndate = NUM_RASTER_SEDIMENT_DATE_VALUES;
+    PetscCall(PetscOptionsGetIntArray(NULL, NULL, "-raster_sediment_start_date", date, &ndate, &raster_start_date_flag));
+
+    PetscCheck(raster_start_date_flag == dirs_flag, PETSC_COMM_WORLD, PETSC_ERR_USER,
+               "Both -raster_sediment_start_date and -raster_sediment_dirs must be specified together.");
+
+    if (!raster_start_date_flag) PetscFunctionReturn(PETSC_SUCCESS);
+
+    PetscCheck(ndate == NUM_RASTER_SEDIMENT_DATE_VALUES, PETSC_COMM_WORLD, PETSC_ERR_USER,
+               "Expect %d values when using -raster_sediment_start_date YY,MO,DD,HH,MM", NUM_RASTER_SEDIMENT_DATE_VALUES);
+    PetscCheck(ndirs > 0, PETSC_COMM_WORLD, PETSC_ERR_USER, "Need at least one raster sediment directory in -raster_sediment_dirs.");
+    PetscCheck(sediment_source->region_id >= 1, PETSC_COMM_WORLD, PETSC_ERR_USER, "Region ID must be >= 1.");
+
+    sediment_source->enabled   = PETSC_TRUE;
+    sediment_source->ndatasets = ndirs;
+    PetscCall(PetscCalloc1(sediment_source->ndatasets, &sediment_source->datasets));
+
+    for (PetscInt i = 0; i < sediment_source->ndatasets; i++) {
+      sediment_source->datasets[i].type = RASTER;
+      sediment_source->datasets[i].unstructured.ndata            = 0;
+      sediment_source->datasets[i].unstructured.stride           = 0;
+      sediment_source->datasets[i].unstructured.mesh_nelements   = 0;
+      sediment_source->datasets[i].unstructured.write_map        = PETSC_FALSE;
+      sediment_source->datasets[i].unstructured.read_map         = PETSC_FALSE;
+      sediment_source->datasets[i].unstructured.write_map_for_debugging = PETSC_FALSE;
+
+      PetscCall(PetscStrcpy(sediment_source->datasets[i].raster.dir, dirs[i]));
+      sediment_source->datasets[i].raster.write_map_for_debugging = write_map_for_debugging;
+      sediment_source->datasets[i].raster.write_map               = write_map;
+      sediment_source->datasets[i].raster.read_map                = read_map;
+      if (write_map || read_map) {
+        PetscCall(PetscStrcpy(sediment_source->datasets[i].raster.map_file, map_file));
+      }
+
+      sediment_source->datasets[i].raster.start_date = (struct tm){
+          .tm_year = date[0] - 1900, .tm_mon = date[1] - 1, .tm_mday = date[2], .tm_hour = date[3], .tm_min = date[4], .tm_isdst = -1};
+      sediment_source->datasets[i].raster.current_date = sediment_source->datasets[i].raster.start_date;
+    }
+  }
+#undef NUM_RASTER_SEDIMENT_DATE_VALUES
+#undef MAX_RASTER_SEDIMENT_DATASETS
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/// @brief Sets up spatially-raster sediment source that is specified via command line
+/// @param rdy             [in]  A RDy struct
+/// @param n               [in]  Number of local cells in the region
+/// @param sediment_source [inout] Pointer to a RasterSedimentSource struct
+/// @return PETSC_SUCESS on success
+PetscErrorCode CreateRasterSedimentDataset(RDy rdy, PetscInt n, RasterSedimentSource *sediment_source) {
+  PetscFunctionBegin;
+
+  PetscCall(ParseRasterSedimentDataOptions(sediment_source));
+  if (!sediment_source->enabled) PetscFunctionReturn(PETSC_SUCCESS);
+
+  PetscInt num_sediment_classes;
+  PetscCall(RDyGetNumSedimentClasses(rdy, &num_sediment_classes));
+  PetscCheck(num_sediment_classes > 0, PETSC_COMM_WORLD, PETSC_ERR_USER,
+             "Raster sediment source was requested, but sediment physics is disabled (physics.sediment.num_classes = 0).");
+  PetscCheck(sediment_source->ndatasets == num_sediment_classes, PETSC_COMM_WORLD, PETSC_ERR_USER,
+             "Number of sediment raster datasets (%" PetscInt_FMT
+             ") must equal physics.sediment.num_classes (%" PetscInt_FMT ").",
+             sediment_source->ndatasets, num_sediment_classes);
+
+  for (PetscInt i = 0; i < sediment_source->ndatasets; i++) {
+    sediment_source->datasets[i].ndata = n;
+    PetscCalloc1(n, &sediment_source->datasets[i].data_for_rdycore);
+    PetscCall(OpenRasterDataset(&sediment_source->datasets[i].raster));
+    PetscCall(DoPostprocessForSourceRasterDataset(rdy, &sediment_source->datasets[i].raster));
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/// @brief First gets sediment source values from dataset and then sets those values in RDy.
+/// @param rdy             [in]    A RDy struct
+/// @param time            [in]    Current time
+/// @param sediment_source [inout] A pointer to a RasterSedimentSource dataset
+/// @return PETSC_SUCESS on success
+PetscErrorCode ApplyRasterSedimentDataset(RDy rdy, PetscReal time, RasterSedimentSource *sediment_source) {
+  PetscFunctionBegin;
+
+  if (!sediment_source->enabled) PetscFunctionReturn(PETSC_SUCCESS);
+
+  for (PetscInt i = 0; i < sediment_source->ndatasets; i++) {
+    if (sediment_source->datasets[i].ndata) {
+      PetscCall(SetRasterSourceData(&sediment_source->datasets[i].raster, time, sediment_source->datasets[i].ndata,
+                                    sediment_source->datasets[i].data_for_rdycore));
+      PetscCall(
+          RDySetRegionalSedimentSource(rdy, sediment_source->region_id, i, sediment_source->datasets[i].ndata, sediment_source->datasets[i].data_for_rdycore));
+    }
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/// @brief Close raster sediment dataset and free up memory.
+/// @param sediment_source [inout] Pointer to a RasterSedimentSource struct
+/// @return PETSC_SUCESS on success
+PetscErrorCode DestroyRasterSedimentDataset(RasterSedimentSource *sediment_source) {
+  PetscFunctionBegin;
+
+  if (!sediment_source->enabled) PetscFunctionReturn(PETSC_SUCCESS);
+
+  for (PetscInt i = 0; i < sediment_source->ndatasets; i++) {
+    if (sediment_source->datasets[i].data_for_rdycore) {
+      PetscCall(PetscFree(sediment_source->datasets[i].data_for_rdycore));
+    }
+    PetscCall(DestroyRasterDataset(&sediment_source->datasets[i].raster));
+  }
+  PetscCall(PetscFree(sediment_source->datasets));
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 /// @brief Set up boundary condition based on command line options
 /// @param rdy   [in]    A RDy struct
 /// @param *data [inout] Pointer to a BoundaryCondition struct
@@ -1685,6 +1861,7 @@ int main(int argc, char *argv[]) {
     // be that RDySetup is setting a default DM for all VecLoads.
 
     SourceSink        rain_dataset;
+    RasterSedimentSource sediment_source;
     BoundaryCondition bc_dataset;
 
     PetscCall(RDySetup(rdy));
@@ -1694,6 +1871,7 @@ int main(int argc, char *argv[]) {
 
     // create rainfall and boundary condition datasets
     PetscCall(CreateRainfallDataset(rdy, n, &rain_dataset));
+    PetscCall(CreateRasterSedimentDataset(rdy, n, &sediment_source));
     PetscCall(CreateBoundaryConditionDataset(rdy, &bc_dataset));
 
     // allocate arrays for inspecting simulation data
@@ -1718,6 +1896,7 @@ int main(int argc, char *argv[]) {
       PetscCall(RDyGetTime(rdy, time_unit, &time));
 
       PetscCall(ApplyRainfallDataset(rdy, time, &rain_dataset));
+      PetscCall(ApplyRasterSedimentDataset(rdy, time, &sediment_source));
       PetscCall(ApplyBoundaryCondition(rdy, time, &bc_dataset));
 
       // advance the solution by the coupling interval specified in the config file
@@ -1749,6 +1928,7 @@ int main(int argc, char *argv[]) {
 
     // clean up
     PetscCall(DestroyRainfallDataset(&rain_dataset));
+    PetscCall(DestroyRasterSedimentDataset(&sediment_source));
     PetscCall(DestroyBoundaryConditionDataset(&bc_dataset));
 
     PetscCall(PetscFree(h));
