@@ -90,6 +90,12 @@ static PetscErrorCode SetOperatorRegions(Operator *op, PetscInt num_regions, RDy
   // the PETSc operator, similar to how restrictions are used in CEED
   if (!CeedEnabled()) {
     PetscCall(CreateSequentialVector(comm, op->num_components * op->mesh->num_owned_cells, op->num_components, &op->petsc.external_sources));
+    if (op->config->physics.sediment.num_classes > 0) {
+      PetscCall(CreateSequentialVector(comm, op->config->physics.sediment.num_classes * op->mesh->num_owned_cells,
+                                       op->config->physics.sediment.num_classes, &op->petsc.sediment_net_flux_by_class));
+    } else {
+      op->petsc.sediment_net_flux_by_class = NULL;
+    }
     PetscCall(CreateSequentialVector(comm, op->mesh->num_owned_cells, NUM_MATERIAL_PROPERTIES, &op->petsc.material_properties));
   }
 
@@ -171,7 +177,8 @@ static PetscErrorCode CreateOperatorSubOperators(Operator *op) {
         PetscCall(CreatePetscFluxOperator(op->config, op->mesh, op->num_boundaries, op->boundaries, op->boundary_conditions,
                                           op->petsc.boundary_values, op->petsc.boundary_fluxes, op->petsc.boundary_fluxes_accum, &op->diagnostics,
                                           &op->petsc.flux));
-        PetscCall(CreatePetscSourceOperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.material_properties, &op->petsc.source));
+        PetscCall(CreatePetscSourceOperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.sediment_net_flux_by_class,
+                                            op->petsc.material_properties, &op->petsc.source));
         break;
       case WELL_BALANCING_BS2002:
         // BS2002 well-balancing is only implemented in the CEED backend;
@@ -179,13 +186,15 @@ static PetscErrorCode CreateOperatorSubOperators(Operator *op) {
         PetscCall(CreatePetscFluxOperator(op->config, op->mesh, op->num_boundaries, op->boundaries, op->boundary_conditions,
                                           op->petsc.boundary_values, op->petsc.boundary_fluxes, op->petsc.boundary_fluxes_accum, &op->diagnostics,
                                           &op->petsc.flux));
-        PetscCall(CreatePetscSourceOperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.material_properties, &op->petsc.source));
+        PetscCall(CreatePetscSourceOperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.sediment_net_flux_by_class,
+                                            op->petsc.material_properties, &op->petsc.source));
         break;
       case WELL_BALANCING_HR:
         PetscCall(CreatePetscFluxHROperator(op->config, op->mesh, op->num_boundaries, op->boundaries, op->boundary_conditions,
                                             op->petsc.boundary_values, op->petsc.boundary_fluxes, op->petsc.boundary_fluxes_accum, &op->diagnostics,
                                             &op->petsc.flux));
-        PetscCall(CreatePetscSourceHROperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.material_properties, &op->petsc.source));
+        PetscCall(CreatePetscSourceHROperator(op->config, op->mesh, op->petsc.external_sources, op->petsc.sediment_net_flux_by_class,
+                                              op->petsc.material_properties, &op->petsc.source));
         break;
     }
   }
@@ -315,6 +324,7 @@ PetscErrorCode DestroyOperator(Operator **op) {
     PetscFree((*op)->petsc.boundary_fluxes);
     PetscFree((*op)->petsc.boundary_fluxes_accum);
     PetscCall(VecDestroy(&(*op)->petsc.external_sources));
+    PetscCall(VecDestroy(&(*op)->petsc.sediment_net_flux_by_class));
     PetscCall(VecDestroy(&(*op)->petsc.material_properties));
     PetscCall(PetscOperatorDestroy(&(*op)->petsc.flux));
     PetscCall(PetscOperatorDestroy(&(*op)->petsc.source));
@@ -1244,6 +1254,37 @@ PetscErrorCode RestoreOperatorDomainExternalSource(Operator *op, OperatorData *s
     PetscCallCEED(RestorePetscSourceOperatorDomainData(op, op->petsc.external_sources, source_data));
   }
   PetscCall(DestroyOperatorData(source_data));
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+PetscErrorCode GetOperatorDomainSedimentNetFluxByClass(Operator *op, OperatorData *net_flux_data) {
+  PetscFunctionBegin;
+
+  PetscInt num_classes = op->config->physics.sediment.num_classes;
+  PetscCheck(num_classes > 0, PETSC_COMM_SELF, PETSC_ERR_USER,
+             "Per-class sediment net flux diagnostics requested, but sediment transport is disabled.");
+  PetscCall(CreateOperatorDomainData(op, num_classes, net_flux_data));
+  if (CeedEnabled()) {
+    for (PetscInt c = 0; c < num_classes; ++c) {
+      for (PetscInt i = 0; i < op->mesh->num_owned_cells; ++i) {
+        net_flux_data->values[c][i] = 0.0;
+      }
+    }
+  } else {
+    PetscCall(GetPetscSourceOperatorDomainData(op, op->petsc.sediment_net_flux_by_class, net_flux_data));
+  }
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+PetscErrorCode RestoreOperatorDomainSedimentNetFluxByClass(Operator *op, OperatorData *net_flux_data) {
+  PetscFunctionBegin;
+
+  if (!CeedEnabled()) {
+    PetscCall(RestorePetscSourceOperatorDomainData(op, op->petsc.sediment_net_flux_by_class, net_flux_data));
+  }
+  PetscCall(DestroyOperatorData(net_flux_data));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }

@@ -163,6 +163,8 @@ typedef struct Operator {
 
       // domain-wide external source vector
       Vec external_sources;
+      // domain-wide per-class sediment net flux diagnostics (erosion - deposition)
+      Vec sediment_net_flux_by_class;
 
       // domain-wide material property vector (# of components == # of scalar properties)
       Vec material_properties;
@@ -201,8 +203,8 @@ PETSC_INTERN PetscErrorCode CreatePetscFluxOperator(RDyConfig *, RDyMesh *, Pets
                                                     OperatorDiagnostics *, PetscOperator *);
 PETSC_INTERN PetscErrorCode CreatePetscFluxHROperator(RDyConfig *, RDyMesh *, PetscInt, RDyBoundary *, RDyCondition *, Vec *, Vec *, Vec *,
                                                       OperatorDiagnostics *, PetscOperator *);
-PETSC_INTERN PetscErrorCode CreatePetscSourceOperator(RDyConfig *, RDyMesh *, Vec, Vec, PetscOperator *);
-PETSC_INTERN PetscErrorCode CreatePetscSourceHROperator(RDyConfig *, RDyMesh *, Vec, Vec, PetscOperator *);
+PETSC_INTERN PetscErrorCode CreatePetscSourceOperator(RDyConfig *, RDyMesh *, Vec, Vec, Vec, PetscOperator *);
+PETSC_INTERN PetscErrorCode CreatePetscSourceHROperator(RDyConfig *, RDyMesh *, Vec, Vec, Vec, PetscOperator *);
 
 //----------------------
 // Operator Data Access
@@ -225,6 +227,8 @@ PETSC_INTERN PetscErrorCode GetOperatorRegionalExternalSource(Operator *, RDyReg
 PETSC_INTERN PetscErrorCode RestoreOperatorRegionalExternalSource(Operator *, RDyRegion, OperatorData *);
 PETSC_INTERN PetscErrorCode GetOperatorDomainExternalSource(Operator *, OperatorData *);
 PETSC_INTERN PetscErrorCode RestoreOperatorDomainExternalSource(Operator *, OperatorData *);
+PETSC_INTERN PetscErrorCode GetOperatorDomainSedimentNetFluxByClass(Operator *, OperatorData *);
+PETSC_INTERN PetscErrorCode RestoreOperatorDomainSedimentNetFluxByClass(Operator *, OperatorData *);
 
 PETSC_INTERN PetscErrorCode GetOperatorRegionalMaterialProperties(Operator *, RDyRegion, OperatorData *);
 PETSC_INTERN PetscErrorCode RestoreOperatorRegionalMaterialProperties(Operator *, RDyRegion, OperatorData *);

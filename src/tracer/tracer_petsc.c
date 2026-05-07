@@ -11,6 +11,7 @@ static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
 static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
 static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
 static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
+// Initial stratification layer concentrations. The active layer reuses the first value.
 static const PetscReal layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
 static const PetscReal partheniades_constant_by_layer[] = {4.e-06, 1.6e-05, 4.e-05};
 static const PetscReal tau_critical_erosion_by_layer[] = {0.25, 0.2, 2.0};
@@ -958,6 +959,7 @@ typedef struct {
   PetscInt  num_flow_comp;     // number of flow components
   PetscInt  num_tracers_comp;  // number of tracers components
   Vec       external_sources;  // external source vector
+  Vec       net_flux_by_class; // per-class sediment net flux diagnostics vector
   Vec       mannings;          // mannings coefficient vector
   PetscReal tiny_h;            // minimum water height for wet conditions
   PetscReal xq2018_threshold;  // threshold for the XQ2018's implicit time integration of source term
@@ -980,6 +982,7 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
 
   TracerSourceOperator *source_op        = context;
   Vec                   source_vec       = source_op->external_sources;
+  Vec                   net_flux_cls_vec = source_op->net_flux_by_class;
   Vec                   mannings_vec     = source_op->mannings;
   RDyMesh              *mesh             = source_op->mesh;
   RDyCells             *cells            = &mesh->cells;
@@ -990,8 +993,9 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
 
   // access Vec data
-  PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
+  PetscScalar *source_ptr, *net_flux_cls_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));      // sequential vector
+  PetscCall(VecGetArray(net_flux_cls_vec, &net_flux_cls_ptr));
   PetscCall(VecGetArray(mannings_vec, &mannings_ptr));  // sequential vector
   PetscCall(VecGetArray(u_local, &u_ptr));              // domain local vector (indexed by local cells)
   PetscCall(VecGetArray(f_global, &f_ptr));             // domain global vector (indexed by owned cells)
@@ -1076,6 +1080,7 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
           PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
 
           f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          net_flux_cls_ptr[num_tracers_comp * owned_cell_id + s] = net_flux;
           bed->bed_mass[idx_a] += deposited_mass;
           deposited_mass_total += deposited_mass;
         }
@@ -1102,6 +1107,7 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   PetscCall(VecRestoreArray(u_local, &u_ptr));
   PetscCall(VecRestoreArray(f_global, &f_ptr));
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
+  PetscCall(VecRestoreArray(net_flux_cls_vec, &net_flux_cls_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
   PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
   PetscCall(PetscFree(eroded_mass_by_class));
@@ -1129,7 +1135,8 @@ static PetscErrorCode DestroyTracerSource(void *context) {
 /// @param [in]  mannings         a Vec containing Manning roughness coefficient for SWE
 /// @param [out] petsc_op         a PetscOperator struct that is created and returned
 /// @return 0 on success, or a non-zero error code on failure
-PetscErrorCode CreatePetscTracerSourceOperator(RDyMesh *mesh, const RDyConfig config, Vec external_sources, Vec mannings, PetscOperator *petsc_op) {
+PetscErrorCode CreatePetscTracerSourceOperator(RDyMesh *mesh, const RDyConfig config, Vec external_sources, Vec net_flux_by_class, Vec mannings,
+                                               PetscOperator *petsc_op) {
   PetscFunctionBegin;
 
   PetscInt num_flow_comp    = 3;  // NOTE: SWE assumed!
@@ -1142,6 +1149,7 @@ PetscErrorCode CreatePetscTracerSourceOperator(RDyMesh *mesh, const RDyConfig co
       .num_flow_comp    = num_flow_comp,
       .num_tracers_comp = num_tracers_comp,
       .external_sources = external_sources,
+      .net_flux_by_class = net_flux_by_class,
       .mannings         = mannings,
       .tiny_h           = config.physics.flow.tiny_h,
       .xq2018_threshold = config.physics.flow.source.xq2018_threshold,
@@ -1432,6 +1440,7 @@ typedef struct {
   PetscInt  num_flow_comp;     // number of flow components
   PetscInt  num_tracers_comp;  // number of tracers components
   Vec       external_sources;  // external source vector
+  Vec       net_flux_by_class; // per-class sediment net flux diagnostics vector
   Vec       mannings;          // mannings coefficient vector
   PetscReal tiny_h;            // minimum water height for wet conditions
   PetscReal xq2018_threshold;  // threshold for XQ2018
@@ -1446,6 +1455,7 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
 
   TracerSourceHROperator *source_op        = context;
   Vec                     source_vec       = source_op->external_sources;
+  Vec                     net_flux_cls_vec = source_op->net_flux_by_class;
   Vec                     mannings_vec     = source_op->mannings;
   RDyMesh                *mesh             = source_op->mesh;
   RDyCells               *cells            = &mesh->cells;
@@ -1453,11 +1463,11 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscInt                num_tracers_comp = source_op->num_tracers_comp;
   TracerBedModel         *bed              = &source_op->bed;
   const PetscReal rhow                    = DENSITY_OF_WATER;
-  //const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
-  const PetscReal h_ero_min               = 0;
+  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
 
-  PetscScalar *source_ptr, *mannings_ptr, *u_ptr, *f_ptr;
+  PetscScalar *source_ptr, *net_flux_cls_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));
+  PetscCall(VecGetArray(net_flux_cls_vec, &net_flux_cls_ptr));
   PetscCall(VecGetArray(mannings_vec, &mannings_ptr));
   PetscCall(VecGetArray(u_local, &u_ptr));
   PetscCall(VecGetArray(f_global, &f_ptr));
@@ -1535,6 +1545,7 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
           PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
 
           f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          net_flux_cls_ptr[num_tracers_comp * owned_cell_id + s] = net_flux;
           bed->bed_mass[idx_a] += deposited_mass;
           deposited_mass_total += deposited_mass;
         }
@@ -1559,6 +1570,7 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscCall(VecRestoreArray(u_local, &u_ptr));
   PetscCall(VecRestoreArray(f_global, &f_ptr));
   PetscCall(VecRestoreArray(source_vec, &source_ptr));
+  PetscCall(VecRestoreArray(net_flux_cls_vec, &net_flux_cls_ptr));
   PetscCall(VecRestoreArray(mannings_vec, &mannings_ptr));
   PetscCall(VecRestoreArray(flux_div, &flux_div_ptr));
   PetscCall(PetscFree(eroded_mass_by_class));
@@ -1578,7 +1590,8 @@ static PetscErrorCode DestroyTracerSourceHR(void *context) {
 
 /// Creates a PetscOperator that computes source terms for HR well-balanced
 /// shallow water equations + tracers (bed slope = 0, friction + erosion/deposition).
-PetscErrorCode CreatePetscTracerSourceHROperator(RDyMesh *mesh, const RDyConfig config, Vec external_sources, Vec mannings, PetscOperator *petsc_op) {
+PetscErrorCode CreatePetscTracerSourceHROperator(RDyMesh *mesh, const RDyConfig config, Vec external_sources, Vec net_flux_by_class,
+                                                 Vec mannings, PetscOperator *petsc_op) {
   PetscFunctionBegin;
 
   PetscInt num_flow_comp    = 3;  // NOTE: SWE assumed!
@@ -1591,6 +1604,7 @@ PetscErrorCode CreatePetscTracerSourceHROperator(RDyMesh *mesh, const RDyConfig 
       .num_flow_comp    = num_flow_comp,
       .num_tracers_comp = num_tracers_comp,
       .external_sources = external_sources,
+      .net_flux_by_class = net_flux_by_class,
       .mannings         = mannings,
       .tiny_h           = config.physics.flow.tiny_h,
       .xq2018_threshold = config.physics.flow.source.xq2018_threshold,

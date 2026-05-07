@@ -124,10 +124,8 @@ static PetscErrorCode WriteGrid(MPI_Comm comm, RDyMesh *mesh, PetscViewer viewer
 static PetscErrorCode UpdateDiagnosticFields(RDy rdy) {
   PetscFunctionBegin;
 
-  // construct a set of available source fields (with a zero-length terminus)
-  // NOTE: so far, all our diagnostics are external source terms, so we can
-  // NOTE: get them all using GetOperatorDomainExternalSource()
-  static char diagnostics_names[3 + MAX_NUM_TRACERS + 1][MAX_NAME_LEN] = {
+  // construct a set of available source fields
+  static char diagnostics_names[3 + 2 * MAX_NUM_TRACERS + 1][MAX_NAME_LEN] = {
       "WaterSource",
       "MomentumXSource",
       "MomentumYSource",
@@ -136,6 +134,7 @@ static PetscErrorCode UpdateDiagnosticFields(RDy rdy) {
   if (first_time) {
     for (PetscInt i = 0; i < rdy->config.physics.sediment.num_classes; ++i) {
       snprintf(diagnostics_names[3 + i], MAX_NAME_LEN, "SedimentConcentration%" PetscInt_FMT "Source", i);
+      snprintf(diagnostics_names[3 + MAX_NUM_TRACERS + i], MAX_NAME_LEN, "SedimentNetFlux%" PetscInt_FMT, i);
     }
     first_time = PETSC_FALSE;
   }
@@ -152,38 +151,80 @@ static PetscErrorCode UpdateDiagnosticFields(RDy rdy) {
   PetscInt num_diags;
   PetscCall(VecGetBlockSize(rdy->vec_diags, &num_diags));
 
-  // fetch the external source components to be output
-  PetscInt *ext_source_comps, num_diags_found = 0;
-  PetscCall(PetscMalloc1(num_diags, &ext_source_comps));
+  // fetch requested source components and class-wise sediment net flux requests
+  PetscInt  *ext_source_comps;
+  PetscBool *is_net_flux_diag;
+  PetscBool  need_source_data     = PETSC_FALSE;
+  PetscBool  need_net_flux_class  = PETSC_FALSE;
+  PetscCall(PetscCalloc1(num_diags, &ext_source_comps));
+  PetscCall(PetscCalloc1(num_diags, &is_net_flux_diag));
   for (PetscInt c = 0; c < num_diags; ++c) {
     const char *diag_name;
     PetscCall(PetscSectionGetComponentName(section, 0, c, &diag_name));
-    if (!strcmp(diag_name, diagnostics_names[c])) {
-      ext_source_comps[num_diags_found++] = c;
+    if (!strcmp(diag_name, diagnostics_names[0])) {
+      ext_source_comps[c] = 0;
+      need_source_data    = PETSC_TRUE;
+    } else if (!strcmp(diag_name, diagnostics_names[1])) {
+      ext_source_comps[c] = 1;
+      need_source_data    = PETSC_TRUE;
+    } else if (!strcmp(diag_name, diagnostics_names[2])) {
+      ext_source_comps[c] = 2;
+      need_source_data    = PETSC_TRUE;
+    } else {
+      PetscBool found = PETSC_FALSE;
+      for (PetscInt i = 0; i < rdy->config.physics.sediment.num_classes; ++i) {
+        if (!strcmp(diag_name, diagnostics_names[3 + i])) {
+          ext_source_comps[c] = 3 + i;
+          need_source_data    = PETSC_TRUE;
+          found               = PETSC_TRUE;
+          break;
+        }
+      }
+      if (!found) {
+        for (PetscInt i = 0; i < rdy->config.physics.sediment.num_classes; ++i) {
+          if (!strcmp(diag_name, diagnostics_names[3 + MAX_NUM_TRACERS + i])) {
+            ext_source_comps[c] = i;
+            is_net_flux_diag[c] = PETSC_TRUE;
+            need_net_flux_class = PETSC_TRUE;
+            break;
+          }
+        }
+      }
     }
   }
 
-  if (num_diags_found == 0) {  // no diagnostics requested
+  if (!need_source_data && !need_net_flux_class) {  // no diagnostics requested
     PetscCall(PetscFree(ext_source_comps));
+    PetscCall(PetscFree(is_net_flux_diag));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
-  // fetch external sources from the operator
-  OperatorData ext_sources = {0};
-  PetscCall(GetOperatorDomainExternalSource(rdy->operator, & ext_sources));
+  // fetch external sources and class-wise sediment net fluxes as needed
+  OperatorData ext_sources   = {0};
+  OperatorData net_flux_cls  = {0};
+  if (need_source_data) PetscCall(GetOperatorDomainExternalSource(rdy->operator, &ext_sources));
+  if (need_net_flux_class) PetscCall(GetOperatorDomainSedimentNetFluxByClass(rdy->operator, &net_flux_cls));
 
   PetscReal *diag_data;
   PetscCall(VecGetArrayWrite(rdy->vec_diags, &diag_data));
   for (PetscInt c = 0; c < num_diags; ++c) {
+    const char *diag_name;
+    PetscCall(PetscSectionGetComponentName(section, 0, c, &diag_name));
     for (PetscInt i = 0; i < rdy->mesh.num_owned_cells; ++i) {
-      diag_data[num_diags * i + c] = ext_sources.values[ext_source_comps[c]][i];
+      if (is_net_flux_diag[c]) {
+        diag_data[num_diags * i + c] = need_net_flux_class ? net_flux_cls.values[ext_source_comps[c]][i] : 0.0;
+      } else {
+        diag_data[num_diags * i + c] = need_source_data ? ext_sources.values[ext_source_comps[c]][i] : 0.0;
+      }
     }
   }
   PetscCall(VecRestoreArrayWrite(rdy->vec_diags, &diag_data));
 
   // put toys away
   PetscCall(PetscFree(ext_source_comps));
-  PetscCall(RestoreOperatorDomainExternalSource(rdy->operator, & ext_sources));
+  PetscCall(PetscFree(is_net_flux_diag));
+  if (need_source_data) PetscCall(RestoreOperatorDomainExternalSource(rdy->operator, &ext_sources));
+  if (need_net_flux_class) PetscCall(RestoreOperatorDomainSedimentNetFluxByClass(rdy->operator, &net_flux_cls));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
