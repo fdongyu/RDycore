@@ -7,14 +7,21 @@
 
 #include "tracer_roe_flux_petsc.h"
 
-static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
-static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
-static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
-static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
-// Initial stratification layer concentrations. The active layer reuses the first value.
-static const PetscReal layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
-static const PetscReal partheniades_constant_by_layer[] = {4.e-06, 1.6e-05, 4.e-05};
-static const PetscReal tau_critical_erosion_by_layer[] = {0.25, 0.2, 2.0};
+//static const PetscReal frac_init_by_class[] = {0.3, 0.3, 0.4};
+//static const PetscReal settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
+//static const PetscReal tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
+//static const PetscReal sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
+//static const PetscReal layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
+//static const PetscReal partheniades_constant_by_layer[] = {4.e-06, 1.6e-05, 4.e-05};
+//static const PetscReal tau_critical_erosion_by_layer[] = {0.25, 0.2, 2.0};
+// dam break
+static const PetscReal frac_init_by_class[] = {1.0};
+static const PetscReal settling_velocity_by_class[] = {1.e-04};
+static const PetscReal tau_critical_deposition_by_class[] = {0.10};
+static const PetscReal sediment_density_by_class[] = {1600.0};
+static const PetscReal layer_concentration_by_layer[] = {100.0};
+static const PetscReal partheniades_constant_by_layer[] = {1.e-04};
+static const PetscReal tau_critical_erosion_by_layer[] = {0.10};
 
 typedef struct {
   PetscInt  num_bed_layers;
@@ -181,8 +188,10 @@ static PetscErrorCode InitializeTracerBedModel(RDyMesh *mesh, PetscInt num_trace
 
   PetscInt ncells = mesh->num_cells;
 
-  bed->active_layer_thickness = 0.05;
-  bed->num_bed_layers         = 4;
+//  bed->active_layer_thickness = 0.05;
+//  bed->num_bed_layers         = 4;
+  bed->active_layer_thickness = 0.10;
+  bed->num_bed_layers         = 2;
 
   const PetscInt nconc = (PetscInt)(sizeof(layer_concentration_by_layer) / sizeof(layer_concentration_by_layer[0]));
   PetscCheck(nconc == num_tracers_comp, comm, PETSC_ERR_USER,
@@ -1048,7 +1057,8 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        //PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+	PetscReal tau_b        = rhow * Cd * (Square(u) + Square(v));
         ComputeTracerErodedMassByClass(bed, c, mesh->num_cells, num_tracers_comp, h, h_ero_min, tau_b, dt, eroded_mass_by_class);
         PetscReal Mtot_a      = ComputeTracerLayerTotalMass(bed, c, 0, mesh->num_cells, num_tracers_comp);
         PetscReal active_conc = ComputeTracerActiveLayerConcentration(bed, c, mesh->num_cells, num_tracers_comp);
@@ -1513,7 +1523,8 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
         tbx = (hu + dt * Fsum_x - dt * bedx) * factor;
         tby = (hv + dt * Fsum_y - dt * bedy) * factor;
 
-        PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+        //PetscReal tau_b        = 0.5 * rhow * Cd * (Square(u) + Square(v));
+	PetscReal tau_b        = rhow * Cd * (Square(u) + Square(v));
         ComputeTracerErodedMassByClass(bed, c, mesh->num_cells, num_tracers_comp, h, h_ero_min, tau_b, dt, eroded_mass_by_class);
         PetscReal Mtot_a      = ComputeTracerLayerTotalMass(bed, c, 0, mesh->num_cells, num_tracers_comp);
         PetscReal active_conc = ComputeTracerActiveLayerConcentration(bed, c, mesh->num_cells, num_tracers_comp);
