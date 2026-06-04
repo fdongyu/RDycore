@@ -728,9 +728,10 @@ PetscErrorCode RDyMMSComputeSourceTerms(RDy rdy, PetscReal time) {
       MMSBedModel mms_bed = {0};
       PetscCall(MMSInitializeBedModel(mesh, num_sediment_classes, rdy->comm, &mms_bed));
 
-      const PetscReal rhow      = DENSITY_OF_WATER;
-      const PetscReal dt        = rdy->config.time.time_step;
-      const PetscReal h_ero_min = PetscMax(1e-1, 10.0 * rdy->config.physics.flow.tiny_h);
+      const PetscReal rhow             = DENSITY_OF_WATER;
+      const PetscReal dt               = rdy->config.time.time_step;
+      const PetscReal h_ero_min        = PetscMax(1e-1, 10.0 * rdy->config.physics.flow.tiny_h);
+      const PetscReal h_sed_source_min = 1e-2;
 
       l = 0;
       for (PetscInt icell = 0; icell < mesh->num_cells; icell++) {
@@ -771,6 +772,8 @@ PetscErrorCode RDyMMSComputeSourceTerms(RDy rdy, PetscReal time) {
             hci_source[l] += u[l] * ci[i][l] * dhdx[l] + h[l] * ci[i][l] * dudx[l] + u[l] * h[l] * dcidx[i][l];
             hci_source[l] += v[l] * ci[i][l] * dhdy[l] + h[l] * ci[i][l] * dvdy[l] + v[l] * h[l] * dcidy[i][l];
             hci_source[l] += -sediment_net_flux[l * num_sediment_classes + i];
+            PetscReal sed_source_factor = PetscMin(1.0, h[l] / h_sed_source_min);
+            if (sed_source_factor > 0.0) hci_source[l] /= sed_source_factor;
             ++l;
           }
         }

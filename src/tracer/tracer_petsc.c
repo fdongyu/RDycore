@@ -998,8 +998,9 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
   PetscReal             tiny_h           = source_op->tiny_h;
   PetscInt              num_tracers_comp = source_op->num_tracers_comp;
   TracerBedModel       *bed              = &source_op->bed;
-  const PetscReal rhow                    = DENSITY_OF_WATER;
-  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
+  const PetscReal rhow             = DENSITY_OF_WATER;
+  const PetscReal h_ero_min        = PetscMax(1e-1, 10.0 * tiny_h);
+  const PetscReal h_sed_source_min = 1e-2;
 
   // access Vec data
   PetscScalar *source_ptr, *net_flux_cls_ptr, *mannings_ptr, *u_ptr, *f_ptr;
@@ -1086,10 +1087,11 @@ static PetscErrorCode ApplyTracerSourceSemiImplicit(void *context, PetscOperator
             if (net_flux < min_net_flux) net_flux = min_net_flux;
           }
 
-          PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-          PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
+          PetscInt  idx_a               = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+          PetscReal deposited_mass      = PetscMax(0.0, (ei - net_flux) * dt);
+          PetscReal external_sed_source = source_ptr[n_dof * owned_cell_id + 3 + s] * PetscMin(1.0, h / h_sed_source_min);
 
-          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + external_sed_source;
           net_flux_cls_ptr[num_tracers_comp * owned_cell_id + s] = net_flux;
           bed->bed_mass[idx_a] += deposited_mass;
           deposited_mass_total += deposited_mass;
@@ -1472,8 +1474,9 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
   PetscReal               tiny_h           = source_op->tiny_h;
   PetscInt                num_tracers_comp = source_op->num_tracers_comp;
   TracerBedModel         *bed              = &source_op->bed;
-  const PetscReal rhow                    = DENSITY_OF_WATER;
-  const PetscReal h_ero_min               = PetscMax(1e-1, 10.0 * tiny_h);
+  const PetscReal rhow             = DENSITY_OF_WATER;
+  const PetscReal h_ero_min        = PetscMax(1e-1, 10.0 * tiny_h);
+  const PetscReal h_sed_source_min = 1e-2;
 
   PetscScalar *source_ptr, *net_flux_cls_ptr, *mannings_ptr, *u_ptr, *f_ptr;
   PetscCall(VecGetArray(source_vec, &source_ptr));
@@ -1552,10 +1555,11 @@ static PetscErrorCode ApplyTracerSourceHRSemiImplicit(void *context, PetscOperat
             if (net_flux < min_net_flux) net_flux = min_net_flux;
           }
 
-          PetscInt  idx_a = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
-          PetscReal deposited_mass = PetscMax(0.0, (ei - net_flux) * dt);
+          PetscInt  idx_a               = BED_INDEX(0, c, s, mesh->num_cells, num_tracers_comp);
+          PetscReal deposited_mass      = PetscMax(0.0, (ei - net_flux) * dt);
+          PetscReal external_sed_source = source_ptr[n_dof * owned_cell_id + 3 + s] * PetscMin(1.0, h / h_sed_source_min);
 
-          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + source_ptr[n_dof * owned_cell_id + 3 + s];
+          f_ptr[n_dof * owned_cell_id + 3 + s] += net_flux + external_sed_source;
           net_flux_cls_ptr[num_tracers_comp * owned_cell_id + s] = net_flux;
           bed->bed_mass[idx_a] += deposited_mass;
           deposited_mass_total += deposited_mass;
