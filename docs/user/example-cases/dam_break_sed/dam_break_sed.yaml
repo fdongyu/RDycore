@@ -7,6 +7,18 @@ physics:
     well_balancing: hydrostatic_reconstruction
   sediment:
     num_classes: 1
+    classes:
+      - initial_fraction: 1.0
+        settling_velocity: 1.e-4
+        critical_deposition_shear_stress: 0.0 # disable deposition for conservative tracer transport
+        density: 1600.0
+    bed:
+      active_layer_thickness: 0.05
+      substrate_layers:
+        - initial_thickness: 0.1
+          concentration: 100.0
+          partheniades_constant: 0.0 # disable erosion for conservative tracer transport
+          critical_erosion_shear_stress: 0.1
 
 numerics:
   spatial: fv

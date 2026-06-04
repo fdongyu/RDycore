@@ -49,6 +49,18 @@
 //       xq2018_threshold: <value> # 1e-10 by default
 //   sediment:
 //     num_classes: 1 # 0 by default
+//     classes:
+//       - initial_fraction: 1.0
+//         settling_velocity: 1.e-4
+//         critical_deposition_shear_stress: 0.1
+//         density: 1600.0
+//     bed:
+//       active_layer_thickness: 0.05
+//       substrate_layers:
+//         - initial_thickness: 0.1
+//           concentration: 100.0
+//           partheniades_constant: 1.e-4
+//           critical_erosion_shear_stress: 0.1
 //   salinity: <true|false> # off by default
 
 // mapping of strings to physics flow types
@@ -85,9 +97,43 @@ static const cyaml_schema_field_t physics_flow_fields_schema[] = {
     CYAML_FIELD_END
 };
 
-// mapping of physics.flow fields to members of RDyPhysicsFlow
+static const cyaml_schema_field_t sediment_class_fields_schema[] = {
+    CYAML_FIELD_FLOAT("initial_fraction", CYAML_FLAG_DEFAULT, RDySedimentClass, initial_fraction),
+    CYAML_FIELD_FLOAT("settling_velocity", CYAML_FLAG_DEFAULT, RDySedimentClass, settling_velocity),
+    CYAML_FIELD_FLOAT("critical_deposition_shear_stress", CYAML_FLAG_DEFAULT, RDySedimentClass, critical_deposition_shear_stress),
+    CYAML_FIELD_FLOAT("density", CYAML_FLAG_DEFAULT, RDySedimentClass, density),
+    CYAML_FIELD_END
+};
+
+static const cyaml_schema_value_t sediment_class_entry = {
+    CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT, RDySedimentClass, sediment_class_fields_schema),
+};
+
+static const cyaml_schema_field_t sediment_substrate_layer_fields_schema[] = {
+    CYAML_FIELD_FLOAT("initial_thickness", CYAML_FLAG_DEFAULT, RDySedimentSubstrateLayer, initial_thickness),
+    CYAML_FIELD_FLOAT("concentration", CYAML_FLAG_DEFAULT, RDySedimentSubstrateLayer, concentration),
+    CYAML_FIELD_FLOAT("partheniades_constant", CYAML_FLAG_DEFAULT, RDySedimentSubstrateLayer, partheniades_constant),
+    CYAML_FIELD_FLOAT("critical_erosion_shear_stress", CYAML_FLAG_DEFAULT, RDySedimentSubstrateLayer, critical_erosion_shear_stress),
+    CYAML_FIELD_END
+};
+
+static const cyaml_schema_value_t sediment_substrate_layer_entry = {
+    CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT, RDySedimentSubstrateLayer, sediment_substrate_layer_fields_schema),
+};
+
+static const cyaml_schema_field_t sediment_bed_fields_schema[] = {
+    CYAML_FIELD_FLOAT("active_layer_thickness", CYAML_FLAG_DEFAULT, RDySedimentBed, active_layer_thickness),
+    CYAML_FIELD_SEQUENCE_COUNT("substrate_layers", CYAML_FLAG_DEFAULT, RDySedimentBed, substrate_layers, substrate_layers_count,
+                               &sediment_substrate_layer_entry, 1, MAX_NUM_SEDIMENT_LAYERS),
+    CYAML_FIELD_END
+};
+
+// mapping of physics.sediment fields to members of RDyPhysicsSD
 static const cyaml_schema_field_t physics_sediment_fields_schema[] = {
     CYAML_FIELD_INT("num_classes", CYAML_FLAG_DEFAULT, RDyPhysicsSD, num_classes),
+    CYAML_FIELD_SEQUENCE_COUNT("classes", CYAML_FLAG_OPTIONAL, RDyPhysicsSD, classes, classes_count, &sediment_class_entry, 0,
+                               MAX_NUM_SEDIMENT_CLASSES),
+    CYAML_FIELD_MAPPING("bed", CYAML_FLAG_OPTIONAL, RDyPhysicsSD, bed, sediment_bed_fields_schema),
     CYAML_FIELD_END
 };
 
@@ -918,6 +964,45 @@ static PetscErrorCode ValidateConfig(MPI_Comm comm, RDyConfig *config, PetscBool
   PetscCheck(config->physics.sediment.num_classes <= MAX_NUM_SEDIMENT_CLASSES, comm, PETSC_ERR_USER,
              "The specified number of sediment classes (%" PetscInt_FMT ") exceeds the maximum (%d)", config->physics.sediment.num_classes,
              MAX_NUM_SEDIMENT_CLASSES);
+  if (config->physics.sediment.num_classes > 0) {
+    RDyPhysicsSD *sediment = &config->physics.sediment;
+    PetscCheck(sediment->classes_count == sediment->num_classes, comm, PETSC_ERR_USER,
+               "physics.sediment.classes must contain exactly %" PetscInt_FMT " entries", sediment->num_classes);
+    PetscCheck(sediment->bed.active_layer_thickness > 0.0, comm, PETSC_ERR_USER,
+               "physics.sediment.bed.active_layer_thickness must be > 0");
+    PetscCheck(sediment->bed.substrate_layers_count > 0, comm, PETSC_ERR_USER,
+               "physics.sediment.bed.substrate_layers must contain at least one entry");
+
+    PetscReal fraction_sum = 0.0;
+    for (PetscInt s = 0; s < sediment->num_classes; ++s) {
+      RDySedimentClass *class = &sediment->classes[s];
+      PetscCheck(class->initial_fraction >= 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.classes[%" PetscInt_FMT "].initial_fraction must be >= 0", s);
+      PetscCheck(class->settling_velocity > 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.classes[%" PetscInt_FMT "].settling_velocity must be > 0", s);
+      PetscCheck(class->critical_deposition_shear_stress >= 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.classes[%" PetscInt_FMT "].critical_deposition_shear_stress must be >= 0", s);
+      PetscCheck(class->density > 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.classes[%" PetscInt_FMT "].density must be > 0", s);
+      fraction_sum += class->initial_fraction;
+    }
+    PetscCheck(PetscAbsReal(fraction_sum - 1.0) < 1e-12, comm, PETSC_ERR_USER,
+               "physics.sediment class initial fractions must sum to 1.0 (got %g)", (double)fraction_sum);
+
+    PetscReal previous_concentration = 0.0;
+    for (PetscInt layer = 0; layer < sediment->bed.substrate_layers_count; ++layer) {
+      RDySedimentSubstrateLayer *substrate = &sediment->bed.substrate_layers[layer];
+      PetscCheck(substrate->initial_thickness > 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.bed.substrate_layers[%" PetscInt_FMT "].initial_thickness must be > 0", layer);
+      PetscCheck(substrate->concentration > previous_concentration, comm, PETSC_ERR_USER,
+                 "physics.sediment.bed.substrate_layers concentrations must be positive and strictly increasing");
+      PetscCheck(substrate->partheniades_constant >= 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.bed.substrate_layers[%" PetscInt_FMT "].partheniades_constant must be >= 0", layer);
+      PetscCheck(substrate->critical_erosion_shear_stress > 0.0, comm, PETSC_ERR_USER,
+                 "physics.sediment.bed.substrate_layers[%" PetscInt_FMT "].critical_erosion_shear_stress must be > 0", layer);
+      previous_concentration = substrate->concentration;
+    }
+  }
 
   // check numerics settings
   if (config->numerics.spatial != SPATIAL_FV) {

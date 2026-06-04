@@ -6,6 +6,26 @@ physics:
     mode: swe
   sediment:
     num_classes: 2
+    classes:
+      - initial_fraction: 0.5
+        settling_velocity: 5.e-4
+        critical_deposition_shear_stress: 0.08
+        density: 1400.0
+      - initial_fraction: 0.5
+        settling_velocity: 1.e-2
+        critical_deposition_shear_stress: 0.12
+        density: 2650.0
+    bed:
+      active_layer_thickness: 0.05
+      substrate_layers:
+        - initial_thickness: 0.1
+          concentration: 100.0
+          partheniades_constant: 4.e-6
+          critical_erosion_shear_stress: 0.25
+        - initial_thickness: 0.1
+          concentration: 300.0
+          partheniades_constant: 1.6e-5
+          critical_erosion_shear_stress: 0.2
 
 numerics:
   spatial: fv

@@ -16,55 +16,27 @@
 static const PetscReal GRAVITY          = 9.806;   // gravitational acceleration [m/s^2]
 static const PetscReal DENSITY_OF_WATER = 1000.0;  // [kg/m^3]
 
-// These tables mirror the active-layer sediment source model in
-// src/tracer/tracer_petsc.c. Keep them synchronized until the sediment
-// parameters are moved into the runtime configuration.
-static const PetscReal mms_frac_init_by_class[] = {0.3, 0.3, 0.4};
-static const PetscReal mms_settling_velocity_by_class[] = {5.e-04, 1.e-02, 1.e-02};
-static const PetscReal mms_tau_critical_deposition_by_class[] = {0.08, 0.12, 0.2};
-static const PetscReal mms_sediment_density_by_class[] = {1400.0, 2650.0, 2650.0};
-static const PetscReal mms_layer_concentration_by_layer[] = {100.0, 300.0, 600.0};
-static const PetscReal mms_partheniades_constant_by_layer[] = {4.e-06, 1.6e-05, 4.e-05};
-static const PetscReal mms_tau_critical_erosion_by_layer[] = {0.25, 0.2, 2.0};
-
 #define MMS_BED_INDEX(layer, cell, s, num_cells, num_tracers_comp) (((layer) * (num_cells) + (cell)) * (num_tracers_comp) + (s))
 
 typedef struct {
-  PetscInt  num_bed_layers;
-  PetscReal active_layer_thickness;
-  PetscReal *bed_mass;
-  PetscReal *active_layer_concentration;
+  const RDyPhysicsSD *sediment;
+  PetscInt            num_bed_layers;
+  PetscReal           active_layer_thickness;
+  PetscReal          *bed_mass;
+  PetscReal          *active_layer_concentration;
 } MMSBedModel;
-
-static PetscErrorCode CheckMMSSedimentTables(PetscInt num_classes, MPI_Comm comm) {
-  PetscFunctionBeginUser;
-
-  const PetscInt nfrac = (PetscInt)(sizeof(mms_frac_init_by_class) / sizeof(mms_frac_init_by_class[0]));
-  const PetscInt nws   = (PetscInt)(sizeof(mms_settling_velocity_by_class) / sizeof(mms_settling_velocity_by_class[0]));
-  const PetscInt ntd   = (PetscInt)(sizeof(mms_tau_critical_deposition_by_class) / sizeof(mms_tau_critical_deposition_by_class[0]));
-  const PetscInt nrho  = (PetscInt)(sizeof(mms_sediment_density_by_class) / sizeof(mms_sediment_density_by_class[0]));
-  const PetscInt nconc = (PetscInt)(sizeof(mms_layer_concentration_by_layer) / sizeof(mms_layer_concentration_by_layer[0]));
-  const PetscInt nkp   = (PetscInt)(sizeof(mms_partheniades_constant_by_layer) / sizeof(mms_partheniades_constant_by_layer[0]));
-  const PetscInt nte   = (PetscInt)(sizeof(mms_tau_critical_erosion_by_layer) / sizeof(mms_tau_critical_erosion_by_layer[0]));
-
-  PetscCheck(nfrac == nws && nfrac == ntd && nfrac == nrho, comm, PETSC_ERR_USER,
-             "MMS sediment class parameter tables have inconsistent lengths");
-  PetscCheck(nconc == nkp && nconc == nte, comm, PETSC_ERR_USER, "MMS sediment layer tables have inconsistent lengths");
-  PetscCheck(num_classes == nfrac && num_classes == nconc, comm, PETSC_ERR_USER,
-             "MMS sediment tables expect %" PetscInt_FMT " classes, but config.physics.sediment.num_classes=%" PetscInt_FMT, nfrac,
-             num_classes);
-
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
 
 static inline PetscInt MMSLayerPropertyIndex(PetscInt layer) { return (layer == 0) ? 0 : (layer - 1); }
 
-static inline PetscReal MMSLayerConcentration(PetscInt layer) { return mms_layer_concentration_by_layer[MMSLayerPropertyIndex(layer)]; }
+static inline PetscReal MMSLayerConcentration(const MMSBedModel *bed, PetscInt layer) {
+  return bed->sediment->bed.substrate_layers[MMSLayerPropertyIndex(layer)].concentration;
+}
 
-static PetscReal MMSClampActiveLayerConcentration(PetscReal active_conc) {
-  const PetscInt nconc = (PetscInt)(sizeof(mms_layer_concentration_by_layer) / sizeof(mms_layer_concentration_by_layer[0]));
-  if (active_conc < mms_layer_concentration_by_layer[0]) active_conc = mms_layer_concentration_by_layer[0];
-  if (active_conc > mms_layer_concentration_by_layer[nconc - 1]) active_conc = mms_layer_concentration_by_layer[nconc - 1];
+static PetscReal MMSClampActiveLayerConcentration(const MMSBedModel *bed, PetscReal active_conc) {
+  const PetscInt nconc = bed->sediment->bed.substrate_layers_count;
+  const RDySedimentSubstrateLayer *layers = bed->sediment->bed.substrate_layers;
+  if (active_conc < layers[0].concentration) active_conc = layers[0].concentration;
+  if (active_conc > layers[nconc - 1].concentration) active_conc = layers[nconc - 1].concentration;
   return active_conc;
 }
 
@@ -78,44 +50,47 @@ static PetscReal MMSComputeLayerTotalMass(const MMSBedModel *bed, PetscInt cell,
   return M_tot;
 }
 
-static void MMSInterpolateActiveLayerErosionProperties(PetscReal active_conc, PetscReal *tau_e_active, PetscReal *kp_active) {
-  const PetscInt nconc = (PetscInt)(sizeof(mms_layer_concentration_by_layer) / sizeof(mms_layer_concentration_by_layer[0]));
+static void MMSInterpolateActiveLayerErosionProperties(const MMSBedModel *bed, PetscReal active_conc, PetscReal *tau_e_active,
+                                                       PetscReal *kp_active) {
+  const PetscInt nconc = bed->sediment->bed.substrate_layers_count;
+  const RDySedimentSubstrateLayer *layers = bed->sediment->bed.substrate_layers;
 
-  if (active_conc <= mms_layer_concentration_by_layer[0]) {
-    *tau_e_active = mms_tau_critical_erosion_by_layer[0];
-    *kp_active    = mms_partheniades_constant_by_layer[0];
+  if (active_conc <= layers[0].concentration) {
+    *tau_e_active = layers[0].critical_erosion_shear_stress;
+    *kp_active    = layers[0].partheniades_constant;
     return;
   }
-  if (active_conc >= mms_layer_concentration_by_layer[nconc - 1]) {
-    *tau_e_active = mms_tau_critical_erosion_by_layer[nconc - 1];
-    *kp_active    = mms_partheniades_constant_by_layer[nconc - 1];
+  if (active_conc >= layers[nconc - 1].concentration) {
+    *tau_e_active = layers[nconc - 1].critical_erosion_shear_stress;
+    *kp_active    = layers[nconc - 1].partheniades_constant;
     return;
   }
 
   for (PetscInt k = 1; k < nconc; ++k) {
-    PetscReal c0 = mms_layer_concentration_by_layer[k - 1];
-    PetscReal c1 = mms_layer_concentration_by_layer[k];
+    PetscReal c0 = layers[k - 1].concentration;
+    PetscReal c1 = layers[k].concentration;
     if (active_conc <= c1) {
       PetscReal alpha = (active_conc - c0) / (c1 - c0);
-      *tau_e_active   = mms_tau_critical_erosion_by_layer[k - 1] +
-                      alpha * (mms_tau_critical_erosion_by_layer[k] - mms_tau_critical_erosion_by_layer[k - 1]);
-      *kp_active = mms_partheniades_constant_by_layer[k - 1] +
-                   alpha * (mms_partheniades_constant_by_layer[k] - mms_partheniades_constant_by_layer[k - 1]);
+      *tau_e_active   = layers[k - 1].critical_erosion_shear_stress +
+                      alpha * (layers[k].critical_erosion_shear_stress - layers[k - 1].critical_erosion_shear_stress);
+      *kp_active = layers[k - 1].partheniades_constant +
+                   alpha * (layers[k].partheniades_constant - layers[k - 1].partheniades_constant);
       return;
     }
   }
 
-  *tau_e_active = mms_tau_critical_erosion_by_layer[nconc - 1];
-  *kp_active    = mms_partheniades_constant_by_layer[nconc - 1];
+  *tau_e_active = layers[nconc - 1].critical_erosion_shear_stress;
+  *kp_active    = layers[nconc - 1].partheniades_constant;
 }
 
-static void MMSGetLayerErosionProperties(PetscInt layer, PetscReal active_conc, PetscReal *tau_e_layer, PetscReal *kp_layer) {
+static void MMSGetLayerErosionProperties(const MMSBedModel *bed, PetscInt layer, PetscReal active_conc, PetscReal *tau_e_layer,
+                                         PetscReal *kp_layer) {
   if (layer == 0) {
-    MMSInterpolateActiveLayerErosionProperties(active_conc, tau_e_layer, kp_layer);
+    MMSInterpolateActiveLayerErosionProperties(bed, active_conc, tau_e_layer, kp_layer);
   } else {
     PetscInt idx = MMSLayerPropertyIndex(layer);
-    *tau_e_layer = mms_tau_critical_erosion_by_layer[idx];
-    *kp_layer    = mms_partheniades_constant_by_layer[idx];
+    *tau_e_layer = bed->sediment->bed.substrate_layers[idx].critical_erosion_shear_stress;
+    *kp_layer    = bed->sediment->bed.substrate_layers[idx].partheniades_constant;
   }
 }
 
@@ -126,7 +101,7 @@ static void MMSComputeErodedMassByClass(MMSBedModel *bed, PetscInt cell, PetscIn
   if (h < h_ero_min || dt <= 0.0) return;
 
   PetscReal remaining_dt = dt;
-  PetscReal active_conc  = MMSClampActiveLayerConcentration(bed->active_layer_concentration[cell]);
+  PetscReal active_conc  = MMSClampActiveLayerConcentration(bed, bed->active_layer_concentration[cell]);
 
   for (PetscInt layer = 0; layer < bed->num_bed_layers && remaining_dt > 0.0; ++layer) {
     PetscReal Mtot_layer = MMSComputeLayerTotalMass(bed, cell, layer, num_cells, num_classes);
@@ -134,7 +109,7 @@ static void MMSComputeErodedMassByClass(MMSBedModel *bed, PetscInt cell, PetscIn
 
     PetscReal tau_e_layer = 0.0;
     PetscReal kp_layer    = 0.0;
-    MMSGetLayerErosionProperties(layer, active_conc, &tau_e_layer, &kp_layer);
+    MMSGetLayerErosionProperties(bed, layer, active_conc, &tau_e_layer, &kp_layer);
 
     if (tau_e_layer <= 0.0 || tau_b <= tau_e_layer) break;
 
@@ -163,25 +138,24 @@ static void MMSComputeErodedMassByClass(MMSBedModel *bed, PetscInt cell, PetscIn
   }
 }
 
-static PetscErrorCode MMSInitializeBedModel(RDyMesh *mesh, PetscInt num_classes, MPI_Comm comm, MMSBedModel *bed) {
+static PetscErrorCode MMSInitializeBedModel(RDyMesh *mesh, const RDyPhysicsSD *sediment, PetscInt num_classes, MPI_Comm comm, MMSBedModel *bed) {
   PetscFunctionBeginUser;
 
-  PetscCall(CheckMMSSedimentTables(num_classes, comm));
-
-  const PetscInt nconc = (PetscInt)(sizeof(mms_layer_concentration_by_layer) / sizeof(mms_layer_concentration_by_layer[0]));
-  bed->active_layer_thickness = 0.05;
-  bed->num_bed_layers         = nconc + 1;
+  PetscCheck(sediment->num_classes == num_classes, comm, PETSC_ERR_USER, "MMS sediment class count does not match its configuration");
+  bed->sediment               = sediment;
+  bed->active_layer_thickness = sediment->bed.active_layer_thickness;
+  bed->num_bed_layers         = sediment->bed.substrate_layers_count + 1;
 
   PetscCall(PetscCalloc1(mesh->num_cells, &bed->active_layer_concentration));
   PetscCall(PetscCalloc1(bed->num_bed_layers * mesh->num_cells * num_classes, &bed->bed_mass));
 
   for (PetscInt c = 0; c < mesh->num_cells; ++c) {
-    bed->active_layer_concentration[c] = mms_layer_concentration_by_layer[0];
+    bed->active_layer_concentration[c] = sediment->bed.substrate_layers[0].concentration;
     for (PetscInt layer = 0; layer < bed->num_bed_layers; ++layer) {
-      PetscReal hL         = (layer == 0) ? bed->active_layer_thickness : 0.1;
-      PetscReal layer_mass = MMSLayerConcentration(layer) * hL;
+      PetscReal hL = (layer == 0) ? bed->active_layer_thickness : sediment->bed.substrate_layers[layer - 1].initial_thickness;
+      PetscReal layer_mass = MMSLayerConcentration(bed, layer) * hL;
       for (PetscInt s = 0; s < num_classes; ++s) {
-        bed->bed_mass[MMS_BED_INDEX(layer, c, s, mesh->num_cells, num_classes)] = layer_mass * mms_frac_init_by_class[s];
+        bed->bed_mass[MMS_BED_INDEX(layer, c, s, mesh->num_cells, num_classes)] = layer_mass * sediment->classes[s].initial_fraction;
       }
     }
   }
@@ -726,7 +700,7 @@ PetscErrorCode RDyMMSComputeSourceTerms(RDy rdy, PetscReal time) {
       }
 
       MMSBedModel mms_bed = {0};
-      PetscCall(MMSInitializeBedModel(mesh, num_sediment_classes, rdy->comm, &mms_bed));
+      PetscCall(MMSInitializeBedModel(mesh, &rdy->config.physics.sediment, num_sediment_classes, rdy->comm, &mms_bed));
 
       const PetscReal rhow             = DENSITY_OF_WATER;
       const PetscReal dt               = rdy->config.time.time_step;
@@ -745,10 +719,10 @@ PetscErrorCode RDyMMSComputeSourceTerms(RDy rdy, PetscReal time) {
           for (PetscInt i = 0; i < num_sediment_classes; ++i) {
             PetscReal ei      = (dt > 0.0) ? eroded_mass_by_class[i] / dt : 0.0;
             PetscReal di      = 0.0;
-            PetscReal tau_d_i = mms_tau_critical_deposition_by_class[i];
+            PetscReal tau_d_i = rdy->config.physics.sediment.classes[i].critical_deposition_shear_stress;
             if (tau_d_i > 0.0 && tau_b < tau_d_i) {
               PetscReal dep_factor = 1.0 - tau_b / tau_d_i;
-              di                   = mms_settling_velocity_by_class[i] * ci[i][l] * dep_factor;
+              di                   = rdy->config.physics.sediment.classes[i].settling_velocity * ci[i][l] * dep_factor;
               if (di < 0.0) di = 0.0;
             }
 

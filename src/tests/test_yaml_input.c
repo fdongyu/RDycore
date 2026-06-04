@@ -65,6 +65,18 @@ static void TestFullSpec(void **state) {
       "    mode: swe\n"
       "  sediment:\n"
       "    num_classes: 1\n"
+      "    classes:\n"
+      "      - initial_fraction: 1.0\n"
+      "        settling_velocity: 1.e-4\n"
+      "        critical_deposition_shear_stress: 0.1\n"
+      "        density: 1600.0\n"
+      "    bed:\n"
+      "      active_layer_thickness: 0.05\n"
+      "      substrate_layers:\n"
+      "        - initial_thickness: 0.1\n"
+      "          concentration: 100.0\n"
+      "          partheniades_constant: 1.e-4\n"
+      "          critical_erosion_shear_stress: 0.1\n"
       "  salinity: false\n\n"
       "numerics:\n"
       "  spatial: fv\n"
@@ -154,6 +166,15 @@ static void TestFullSpec(void **state) {
   RDy rdy;
   assert_int_equal(0, RDyCreate(PETSC_COMM_WORLD, "full_spec", &rdy));
   assert_int_equal(0, ReadConfigString(state, rdy, config_string));
+  assert_int_equal(1, rdy->config.physics.sediment.classes_count);
+  assert_float_equal(1.0, rdy->config.physics.sediment.classes[0].initial_fraction, 1.e-12);
+  assert_float_equal(1.e-4, rdy->config.physics.sediment.classes[0].settling_velocity, 1.e-12);
+  assert_float_equal(0.1, rdy->config.physics.sediment.classes[0].critical_deposition_shear_stress, 1.e-12);
+  assert_float_equal(1600.0, rdy->config.physics.sediment.classes[0].density, 1.e-12);
+  assert_float_equal(0.05, rdy->config.physics.sediment.bed.active_layer_thickness, 1.e-12);
+  assert_int_equal(1, rdy->config.physics.sediment.bed.substrate_layers_count);
+  assert_float_equal(0.1, rdy->config.physics.sediment.bed.substrate_layers[0].initial_thickness, 1.e-12);
+  assert_float_equal(100.0, rdy->config.physics.sediment.bed.substrate_layers[0].concentration, 1.e-12);
 
   assert_int_equal(0, RDyDestroy(&rdy));
 }

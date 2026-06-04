@@ -3,6 +3,34 @@ physics:
     mode: swe
   sediment:
     num_classes: 3
+    classes:
+      - initial_fraction: 0.3
+        settling_velocity: 5.e-4
+        critical_deposition_shear_stress: 0.08
+        density: 1400.0
+      - initial_fraction: 0.3
+        settling_velocity: 1.e-2
+        critical_deposition_shear_stress: 0.12
+        density: 2650.0
+      - initial_fraction: 0.4
+        settling_velocity: 1.e-2
+        critical_deposition_shear_stress: 0.2
+        density: 2650.0
+    bed:
+      active_layer_thickness: 0.05
+      substrate_layers:
+        - initial_thickness: 0.1
+          concentration: 100.0
+          partheniades_constant: 4.e-6
+          critical_erosion_shear_stress: 0.25
+        - initial_thickness: 0.1
+          concentration: 300.0
+          partheniades_constant: 1.6e-5
+          critical_erosion_shear_stress: 0.2
+        - initial_thickness: 0.1
+          concentration: 600.0
+          partheniades_constant: 4.e-5
+          critical_erosion_shear_stress: 2.0
 
 numerics:
   spatial : fv
@@ -83,15 +111,15 @@ mms:
       c0:
         L1: 0.93
         L2: 0.93
-        Linf: 0.95
+        Linf: 0.94
       c1:
         L1: 0.93
         L2: 0.93
-        Linf: 0.95
+        Linf: 0.94
       c2:
         L1: 0.93
         L2: 0.93
-        Linf: 0.95
+        Linf: 0.94
 
 logging:
   level: none
@@ -117,4 +145,3 @@ regions:
 boundaries:
   - name: domain_boundary
     grid_boundary_id: 1
-

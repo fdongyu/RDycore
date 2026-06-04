@@ -33,6 +33,9 @@
 // the maximum number of flow/sediment/salinity conditions that can be defined for a simulation
 #define MAX_NUM_CONDITIONS 32
 
+// the maximum number of substrate layers in the sediment bed model
+#define MAX_NUM_SEDIMENT_LAYERS 32
+
 // The data structures below are intermediate representations of the sections
 // in the YAML configuration file. We parse this file with a YAML parser that
 // populates these data structures using a YAML schema. The parser is implemented
@@ -76,7 +79,30 @@ typedef struct {
 } RDyPhysicsFlow;
 
 typedef struct {
-  PetscInt num_classes;  // number of sediment classes
+  PetscReal initial_fraction;
+  PetscReal settling_velocity;
+  PetscReal critical_deposition_shear_stress;
+  PetscReal density;
+} RDySedimentClass;
+
+typedef struct {
+  PetscReal initial_thickness;
+  PetscReal concentration;
+  PetscReal partheniades_constant;
+  PetscReal critical_erosion_shear_stress;
+} RDySedimentSubstrateLayer;
+
+typedef struct {
+  PetscReal                  active_layer_thickness;
+  RDySedimentSubstrateLayer substrate_layers[MAX_NUM_SEDIMENT_LAYERS];
+  PetscInt                   substrate_layers_count;
+} RDySedimentBed;
+
+typedef struct {
+  PetscInt         num_classes;  // number of sediment classes
+  RDySedimentClass classes[MAX_NUM_SEDIMENT_CLASSES];
+  PetscInt         classes_count;
+  RDySedimentBed   bed;
 } RDyPhysicsSD;
 
 // all physics parameters

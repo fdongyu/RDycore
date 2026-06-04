@@ -498,6 +498,18 @@ physics:
       xq2018_threshold: 1e-10
   sediment:
     num_classes: 1
+    classes:
+      - initial_fraction: 1.0
+        settling_velocity: 1.e-4
+        critical_deposition_shear_stress: 0.1
+        density: 1600.0
+    bed:
+      active_layer_thickness: 0.05
+      substrate_layers:
+        - initial_thickness: 0.1
+          concentration: 100.0
+          partheniades_constant: 1.e-4
+          critical_erosion_shear_stress: 0.1
   salinity: false
 ```
 
@@ -530,6 +542,18 @@ The second physical model is the sediment dynamics model, which evolves the
 concentrations of distinct size classes of sediments. You can set the number of
 size classes with the `num_classes` parameter (default value: `0`). Disable
 sediment dynamics by setting `num_classes` to `0`.
+
+When sediment dynamics are enabled, `classes` must contain one entry per
+sediment class. Each entry specifies its initial bed fraction, settling
+velocity, critical deposition shear stress, and grain density. Initial
+fractions must sum to `1.0`.
+
+The sediment `bed` contains one active layer and one or more substrate layers.
+`active_layer_thickness` specifies the active-layer thickness.
+`substrate_layers` specifies the initial thickness, concentration,
+Partheniades erosion constant, and critical erosion shear stress of each
+substrate layer. The total number of bed layers is therefore one plus the
+number of `substrate_layers`.
 
 The third physical model is the salinity model, which you can also enable or
 disable this by setting the `salinity` parameter to `true` or `false`.
