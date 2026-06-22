@@ -649,14 +649,15 @@ PetscErrorCode CreatePetscTracerInteriorFluxOperator(RDyMesh *mesh, const RDyCon
 //------------------------
 
 typedef struct {
-  RDyNumericsRiemann     riemann;             // riemann solver type
-  RDyMesh               *mesh;                // domain mesh
-  RDyBoundary            boundary;            // boundary associated with this sub-operator
-  RDyCondition           boundary_condition;  // boundary condition associated with this sub-operator
-  Vec                    boundary_values;     // Dirichlet boundary values vector
-  Vec                    boundary_fluxes;     // boundary flux values vector
-  OperatorDiagnostics   *diagnostics;         // courant number, boundary fluxes
-  PetscReal              tiny_h;              // minimum water height for wet conditions
+  RDyNumericsRiemann     riemann;                 // riemann solver type
+  RDyMesh               *mesh;                    // domain mesh
+  RDyBoundary            boundary;                // boundary associated with this sub-operator
+  RDyCondition           boundary_condition;      // boundary condition associated with this sub-operator
+  Vec                    boundary_values;         // Dirichlet boundary values vector
+  Vec                    boundary_fluxes;         // boundary flux values vector
+  Vec                    boundary_fluxes_accum;   // time-integrated boundary flux values
+  OperatorDiagnostics   *diagnostics;             // courant number, boundary fluxes
+  PetscReal              tiny_h;                  // minimum water height for wet conditions
   PetscReal              h_anuga_regular;
   TracerRiemannStateData left_states;
   TracerRiemannStateData right_states;
@@ -724,10 +725,11 @@ static PetscErrorCode ApplyTracerBoundaryFlux(void *context, PetscOperatorFields
 
   TracerBoundaryFluxOperator *boundary_flux_op = context;
 
-  RDyBoundary  boundary           = boundary_flux_op->boundary;
-  RDyCondition boundary_condition = boundary_flux_op->boundary_condition;
-  Vec          boundary_values    = boundary_flux_op->boundary_values;
-  Vec          boundary_fluxes    = boundary_flux_op->boundary_fluxes;
+  RDyBoundary  boundary              = boundary_flux_op->boundary;
+  RDyCondition boundary_condition     = boundary_flux_op->boundary_condition;
+  Vec          boundary_values       = boundary_flux_op->boundary_values;
+  Vec          boundary_fluxes       = boundary_flux_op->boundary_fluxes;
+  Vec          boundary_fluxes_accum = boundary_flux_op->boundary_fluxes_accum;
 
   // get pointers to vector data
   PetscScalar *u_ptr, *f_ptr, *boundary_values_ptr, *boundary_fluxes_ptr;
@@ -849,6 +851,10 @@ static PetscErrorCode ApplyTracerBoundaryFlux(void *context, PetscOperatorFields
   // restore vectors
   PetscCall(VecRestoreArray(u_local, &u_ptr));
   PetscCall(VecRestoreArray(f_global, &f_ptr));
+  PetscCall(VecRestoreArray(boundary_values, &boundary_values_ptr));
+  PetscCall(VecRestoreArray(boundary_fluxes, &boundary_fluxes_ptr));
+
+  PetscCall(VecAXPY(boundary_fluxes_accum, dt, boundary_fluxes));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -871,18 +877,19 @@ static PetscErrorCode DestroyTracerBoundaryFlux(void *context) {
 }
 
 /// @brief Creates an operator for computing fluxes through boundary edges.
-/// @param [in]  mesh               mesh defining the computational domain of the operator
-/// @param [in]  config             RDycore's configuration
-/// @param [in]  boundary           a RDyBoundary struct for the boundary edges
-/// @param [in]  boundary_condition a RDyCondition struct for all boundary conditions
-/// @param [in]  boundary_values    a Vec containing values for the boundary conditions
-/// @param [in]  boundary_fluxes    a Vec to accumulating boundary fluxes
-/// @param [in]  diagnostics        an OperatorDiagnostics struct
-/// @param [out] petsc_op           a PetscOperator struct that is created and returned
+/// @param [in]  mesh                    mesh defining the computational domain of the operator
+/// @param [in]  config                  RDycore's configuration
+/// @param [in]  boundary                a RDyBoundary struct for the boundary edges
+/// @param [in]  boundary_condition      a RDyCondition struct for all boundary conditions
+/// @param [in]  boundary_values         a Vec containing values for the boundary conditions
+/// @param [in]  boundary_fluxes         a Vec containing instantaneous boundary fluxes
+/// @param [in]  boundary_fluxes_accum  a Vec accumulating time-integrated boundary fluxes
+/// @param [in]  diagnostics             an OperatorDiagnostics struct
+/// @param [out] petsc_op                a PetscOperator struct that is created and returned
 /// @return 0 on success, or a non-zero error code on failure
 PetscErrorCode CreatePetscTracerBoundaryFluxOperator(RDyMesh *mesh, const RDyConfig config, RDyBoundary boundary, RDyCondition boundary_condition,
-                                                     Vec boundary_values, Vec boundary_fluxes, OperatorDiagnostics *diagnostics,
-                                                     PetscOperator *petsc_op) {
+                                                     Vec boundary_values, Vec boundary_fluxes, Vec boundary_fluxes_accum,
+                                                     OperatorDiagnostics *diagnostics, PetscOperator *petsc_op) {
   PetscFunctionBegin;
 
   PetscInt num_flow_comp    = 3;  // NOTE: SWE assumed!
@@ -891,14 +898,15 @@ PetscErrorCode CreatePetscTracerBoundaryFluxOperator(RDyMesh *mesh, const RDyCon
   TracerBoundaryFluxOperator *boundary_flux_op;
   PetscCall(PetscCalloc1(1, &boundary_flux_op));
   *boundary_flux_op = (TracerBoundaryFluxOperator){
-      .mesh               = mesh,
-      .boundary           = boundary,
-      .boundary_condition = boundary_condition,
-      .boundary_values    = boundary_values,
-      .boundary_fluxes    = boundary_fluxes,
-      .diagnostics        = diagnostics,
-      .tiny_h             = config.physics.flow.tiny_h,
-      .h_anuga_regular    = config.physics.flow.h_anuga_regular,
+      .mesh                    = mesh,
+      .boundary                = boundary,
+      .boundary_condition      = boundary_condition,
+      .boundary_values         = boundary_values,
+      .boundary_fluxes         = boundary_fluxes,
+      .boundary_fluxes_accum  = boundary_fluxes_accum,
+      .diagnostics             = diagnostics,
+      .tiny_h                  = config.physics.flow.tiny_h,
+      .h_anuga_regular         = config.physics.flow.h_anuga_regular,
   };
 
   // allocate left/right/edge Riemann data structures

@@ -41,8 +41,8 @@ PetscErrorCode CreatePetscFluxOperator(RDyConfig *config, RDyMesh *mesh, PetscIn
     RDyBoundary   boundary  = boundaries[b];
     RDyCondition  condition = boundary_conditions[b];
     if (config->physics.sediment.num_classes > 0) {
-      PetscCall(CreatePetscTracerBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b], diagnostics,
-                                                      &boundary_flux_op));
+      PetscCall(CreatePetscTracerBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b],
+                                                      boundary_fluxes_accum[b], diagnostics, &boundary_flux_op));
     } else {
       PetscCall(CreatePetscSWEBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b],
                                                    boundary_fluxes_accum[b], diagnostics, &boundary_flux_op));
@@ -83,8 +83,8 @@ PetscErrorCode CreatePetscFluxHROperator(RDyConfig *config, RDyMesh *mesh, Petsc
     RDyBoundary   boundary  = boundaries[b];
     RDyCondition  condition = boundary_conditions[b];
     if (config->physics.sediment.num_classes > 0) {
-      PetscCall(CreatePetscTracerBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b], diagnostics,
-                                                      &boundary_flux_op));
+      PetscCall(CreatePetscTracerBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b],
+                                                      boundary_fluxes_accum[b], diagnostics, &boundary_flux_op));
     } else {
       PetscCall(CreatePetscSWEBoundaryFluxOperator(mesh, *config, boundary, condition, boundary_values[b], boundary_fluxes[b],
                                                    boundary_fluxes_accum[b], diagnostics, &boundary_flux_op));

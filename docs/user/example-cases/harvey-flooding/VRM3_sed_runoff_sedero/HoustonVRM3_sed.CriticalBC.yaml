@@ -45,7 +45,7 @@ logging:
 time:
   stop             : 691200.0 # 8 days
   coupling_interval: 3600.0   # 60 mins
-  time_step        : 0.1
+  time_step        : 0.5
   unit             : seconds
 
 output:
@@ -60,7 +60,7 @@ output:
     - SedimentNetFlux1
     - SedimentNetFlux2
   format: xdmf
-  output_interval: 36000       # 1-hr (=36000 * 0.1 sec = 3600 sec)
+  output_interval: 7200       # 1-hr (=36000 * 0.1 sec = 3600 sec)
   batch_size: 60               # 24 time slices put in a single .h5
 
 grid:
@@ -97,7 +97,8 @@ boundary_conditions:
 flow_conditions:
   - name: domain_flow_ic
     type: dirichlet
-    file: Turning_30_90_1500_1000_IC_from_Telemac.bin
+#    file: Turning_30_90_1500_1000_IC_from_Telemac.bin
+    file: /global/cfs/projectdirs/m4267/dongyu/DATA/VRM3_sed/Turning_30_90_1500_1000_IC0.bin
     format: binary
   - name: outflow_bc
     type: dirichlet
@@ -109,13 +110,16 @@ sediment_conditions:
   - name: domain_sediment_ic
     type: dirichlet
     c0:
-      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+#      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+      file: /global/cfs/projectdirs/m4267/dongyu/DATA/VRM3_sed/Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
       format: binary
     c1:
-      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+#      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+      file: /global/cfs/projectdirs/m4267/dongyu/DATA/VRM3_sed/Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
       format: binary
     c2:
-      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+#      file: Turning_30_90_1500_1000_IC_sed_from_Telemac.bin
+      file: /global/cfs/projectdirs/m4267/dongyu/DATA/VRM3_sed/Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
       format: binary
   - name: sed_bc
     type: dirichlet

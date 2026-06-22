@@ -19,14 +19,6 @@ PETSC_INTERN PetscBool      CeedEnabled(void);
 PETSC_INTERN Ceed           CeedContext(void);
 PETSC_INTERN PetscErrorCode GetCeedVecType(VecType *);
 
-// This type keeps track of accumulated time series data appended periodically
-// to files.
-typedef struct {
-  PetscReal water_mass;
-  PetscReal x_momentum;
-  PetscReal y_momentum;
-} TimeSeriesBoundaryFlux;
-
 typedef struct {
   // fluxes on boundary edges
   struct {
@@ -38,9 +30,11 @@ typedef struct {
     PetscInt *global_flux_md;
     // array of per-boundary offsets in local fluxes array below
     PetscInt *offsets;
+    // number of flow and tracer flux components stored for each edge
+    PetscInt num_components;
 
-    // local array of boundary fluxes
-    TimeSeriesBoundaryFlux *fluxes;
+    // local array of boundary fluxes, indexed by edge then component
+    PetscReal *fluxes;
 
     // last step for which boundary flux time series data was written
     PetscInt last_step;
