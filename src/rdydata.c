@@ -1,3 +1,4 @@
+#include <muParserDLL.h>
 #include <private/rdycoreimpl.h>
 #include <private/rdyoperatorimpl.h>
 #include <private/rdysweimpl.h>
@@ -130,6 +131,35 @@ PetscErrorCode RDySetSedimentDirichletBoundaryValues(RDy rdy, const PetscInt bou
   PetscInt comp_offset = 3;
   PetscCheck(rdy->config.physics.flow.mode == FLOW_SWE, PETSC_COMM_WORLD, PETSC_ERR_USER, "Extend the code to set offset correctly");
   PetscCall(SetOperatorBoundaryValues(rdy->operator, boundary, comp_offset, num_classes, num_edges, values));
+
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+PetscErrorCode RDyUpdateSedimentDirichletBoundaryValues(RDy rdy, const PetscInt boundary_index, const PetscInt num_edges, const PetscInt flow_ndof,
+                                                        PetscReal *flow_values) {
+  PetscFunctionBegin;
+
+  PetscCall(CheckBoundaryParameters(rdy, boundary_index, num_edges));
+
+  PetscInt num_classes = rdy->config.physics.sediment.num_classes;
+  if (num_classes == 0) PetscFunctionReturn(PETSC_SUCCESS);
+
+  RDyCondition boundary_cond = rdy->boundary_conditions[boundary_index];
+  if (!boundary_cond.sediment || boundary_cond.sediment->type != CONDITION_DIRICHLET) PetscFunctionReturn(PETSC_SUCCESS);
+
+  PetscCheck(flow_ndof >= 1, rdy->comm, PETSC_ERR_USER, "Flow boundary values must include at least the height component.");
+
+  PetscReal *sediment_boundary_values;
+  PetscCall(PetscCalloc1(num_classes * num_edges, &sediment_boundary_values));
+  for (PetscInt e = 0; e < num_edges; ++e) {
+    PetscReal h = flow_values[flow_ndof * e];
+    for (PetscInt s = 0; s < num_classes; ++s) {
+      PetscReal c = mupEval(boundary_cond.sediment->classes[s].value);
+      sediment_boundary_values[num_classes * e + s] = h * c;
+    }
+  }
+  PetscCall(RDySetSedimentDirichletBoundaryValues(rdy, boundary_index, num_edges, num_classes, sediment_boundary_values));
+  PetscCall(PetscFree(sediment_boundary_values));
 
   PetscFunctionReturn(PETSC_SUCCESS);
 }

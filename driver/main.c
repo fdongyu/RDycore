@@ -1761,6 +1761,7 @@ PetscErrorCode ApplyBoundaryCondition(RDy rdy, PetscReal time, BoundaryCondition
       if (bc_dataset->ndata) {
         PetscCall(SetHomogeneousBoundary(&bc_dataset->homogeneous, time, bc_dataset->ndata / 3, bc_dataset->data_for_rdycore));
         PetscCall(RDySetFlowDirichletBoundaryValues(rdy, bc_dataset->dirichlet_bc_idx, bc_dataset->ndata / 3, 3, bc_dataset->data_for_rdycore));
+        PetscCall(RDyUpdateSedimentDirichletBoundaryValues(rdy, bc_dataset->dirichlet_bc_idx, bc_dataset->ndata / 3, 3, bc_dataset->data_for_rdycore));
       }
       break;
     case RASTER:
@@ -1770,6 +1771,7 @@ PetscErrorCode ApplyBoundaryCondition(RDy rdy, PetscReal time, BoundaryCondition
       if (bc_dataset->ndata) {
         PetscCall(SetUnstructuredData(&bc_dataset->unstructured, time, bc_dataset->data_for_rdycore));
         PetscCall(RDySetFlowDirichletBoundaryValues(rdy, bc_dataset->dirichlet_bc_idx, bc_dataset->ndata / 3, 3, bc_dataset->data_for_rdycore));
+        PetscCall(RDyUpdateSedimentDirichletBoundaryValues(rdy, bc_dataset->dirichlet_bc_idx, bc_dataset->ndata / 3, 3, bc_dataset->data_for_rdycore));
       }
       break;
     case MULTI_HOMOGENEOUS:
@@ -1782,6 +1784,7 @@ PetscErrorCode ApplyBoundaryCondition(RDy rdy, PetscReal time, BoundaryCondition
           PetscCall(
               SetHomogeneousBoundary(&bc_dataset->multihomogeneous.data[data_idx], time, nedges, bc_dataset->multihomogeneous.data_for_rdycore[ibc]));
           PetscCall(RDySetFlowDirichletBoundaryValues(rdy, bc_idx, nedges, 3, bc_dataset->multihomogeneous.data_for_rdycore[ibc]));
+          PetscCall(RDyUpdateSedimentDirichletBoundaryValues(rdy, bc_idx, nedges, 3, bc_dataset->multihomogeneous.data_for_rdycore[ibc]));
         }
       }
       break;

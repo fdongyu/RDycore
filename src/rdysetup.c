@@ -1237,20 +1237,7 @@ PetscErrorCode InitDirichletBoundaryConditions(RDy rdy) {
         }
         PetscCall(RDySetFlowDirichletBoundaryValues(rdy, boundary.index, boundary.num_edges, 3, boundary_values));
 
-        if (rdy->config.physics.sediment.num_classes > 0 && boundary_cond.sediment && boundary_cond.sediment->type == CONDITION_DIRICHLET) {
-          PetscInt  num_sediment_classes = rdy->config.physics.sediment.num_classes;
-          PetscReal *sediment_boundary_values;
-          PetscCall(PetscCalloc1(num_sediment_classes * boundary.num_edges, &sediment_boundary_values));
-          for (PetscInt e = 0; e < boundary.num_edges; ++e) {
-            PetscReal h = boundary_values[3 * e];
-            for (PetscInt s = 0; s < num_sediment_classes; ++s) {
-              PetscReal c = mupEval(boundary_cond.sediment->classes[s].value);
-              sediment_boundary_values[num_sediment_classes * e + s] = h * c;
-            }
-          }
-          PetscCall(RDySetSedimentDirichletBoundaryValues(rdy, boundary.index, boundary.num_edges, num_sediment_classes, sediment_boundary_values));
-          PetscCall(PetscFree(sediment_boundary_values));
-        }
+        PetscCall(RDyUpdateSedimentDirichletBoundaryValues(rdy, boundary.index, boundary.num_edges, 3, boundary_values));
         break;
       case CONDITION_REFLECTING:
         break;
