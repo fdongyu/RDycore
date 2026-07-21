@@ -1,0 +1,129 @@
+physics:
+  flow:
+    mode: swe
+#    well_balancing: hydrostatic_reconstruction
+    h_anuga_reg_parameter: 0.01
+  sediment:
+    num_classes: 3
+    classes:
+      - initial_fraction: 0.3
+        settling_velocity: 5.e-4
+        critical_deposition_shear_stress: 0.08
+        density: 1400.0
+      - initial_fraction: 0.3
+        settling_velocity: 1.e-2
+        critical_deposition_shear_stress: 0.12
+        density: 2650.0
+      - initial_fraction: 0.4
+        settling_velocity: 1.e-2
+        critical_deposition_shear_stress: 0.2
+        density: 2650.0
+    bed:
+      active_layer_thickness: 0.05
+      substrate_layers:
+        - initial_thickness: 0.1
+          concentration: 100.0
+          partheniades_constant: 4.e-6
+          critical_erosion_shear_stress: 0.25
+        - initial_thickness: 0.1
+          concentration: 300.0
+          partheniades_constant: 1.6e-5
+          critical_erosion_shear_stress: 0.2
+        - initial_thickness: 0.1
+          concentration: 600.0
+          partheniades_constant: 4.e-5
+          critical_erosion_shear_stress: 2.0
+
+numerics:
+  spatial: fv
+  temporal: euler
+  riemann: roe
+
+logging:
+  level: debug
+
+time:
+  stop             : 691200.0 # 8 days
+  coupling_interval: 3600.0   # 60 mins
+  time_step        : 0.5
+  unit             : seconds
+
+output:
+  fields:
+    - Height
+    - MomentumX
+    - MomentumY
+    - SedimentConcentration0
+    - SedimentConcentration1
+    - SedimentConcentration2
+    - SedimentNetFlux0
+    - SedimentNetFlux1
+    - SedimentNetFlux2
+  format: xdmf
+  output_interval: 7200       # 1-hr (=36000 * 0.1 sec = 3600 sec)
+  batch_size: 60               # 24 time slices put in a single .h5
+  time_series:
+    boundary_fluxes: 7200
+
+grid:
+  file: Turning_30_90_1500_1000.exo
+
+regions:
+  - name: domain
+    grid_region_id: 1
+
+surface_composition:
+  - region: domain
+    material: smooth
+
+materials:
+  - name: smooth
+    properties:
+      manning:
+        value: 0.015
+
+initial_conditions:
+  - region: domain
+    flow: domain_flow_ic
+    sediment: domain_sediment_ic
+
+boundaries:
+  - name: outlet
+    grid_boundary_id: 1
+
+boundary_conditions:
+  - boundaries: [outlet]
+    flow: tidal_bc
+    sediment: sed_bc
+
+flow_conditions:
+  - name: domain_flow_ic
+    type: dirichlet
+    file: Turning_30_90_1500_1000_IC0.bin
+    format: binary
+  - name: tidal_bc
+    type: dirichlet
+    height: 0
+    x_momentum: 0
+    y_momentum: 0
+
+sediment_conditions:
+  - name: domain_sediment_ic
+    type: dirichlet
+    c0:
+      file: Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
+      format: binary
+    c1:
+      file: Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
+      format: binary
+    c2:
+      file: Turning_30_90_1500_1000_IC_sed_h0m_c0.bin
+      format: binary
+  - name: sed_bc
+    type: dirichlet
+    c0:
+      value: 0.006
+    c1:
+      value: 0.006
+    c2:
+      value: 0.008
